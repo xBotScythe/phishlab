@@ -1,0 +1,31 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+generator client_py {
+  provider = "prisma-client-py"
+  recursive_type_depth = 5
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model AnalysisRun {
+  id            String   @id
+  url           String?
+  status        String   @default("pending")
+  folder        String
+  report        String?  @db.Text
+  createdAt     DateTime @default(now())
+  hasScreenshot Boolean  @default(false)
+  error         String?
+}
+
+model FeedStatus {
+  id        Int      @id @default(1)
+  active    Boolean  @default(false)
+  lastRun   DateTime?
+  batchSize Int      @default(5)
+}
