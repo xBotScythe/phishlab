@@ -1,0 +1,21 @@
+# host environment dependencies
+
+# rest api + sse streaming layer
+fastapi
+uvicorn[standard]
+
+# model context protocol sdk
+mcp
+
+# local ai model client
+ollama
+
+# html parsing for ioc extraction
+beautifulsoup4
+
+# threat feed retrieval
+requests
+python-whois
+
+# database
+prisma

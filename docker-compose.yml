@@ -1,0 +1,16 @@
+services:
+  db:
+    image: postgres:17
+    container_name: phishlab-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: phishlab_secure_password
+      POSTGRES_DB: phishlab
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: always
+
+volumes:
+  postgres_data:
