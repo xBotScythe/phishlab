@@ -12,6 +12,7 @@ type Run = {
   status: string;
   has_report: boolean;
   has_screenshot: boolean;
+  created_at: string | null;
 };
 
 export default function RunsList({ limit }: { limit?: number }) {
@@ -141,7 +142,9 @@ export default function RunsList({ limit }: { limit?: number }) {
                       {run.url ?? "// UNKNOWN_TARGET"}
                     </p>
                     <p className="text-[0.65rem] text-dim uppercase tracking-widest mt-0.5">
-                      ID: {run.id}
+                      {run.created_at
+                        ? new Date(run.created_at).toLocaleString()
+                        : `ID: ${run.id}`}
                     </p>
                   </div>
                   <div className="flex items-center gap-4 ml-4">

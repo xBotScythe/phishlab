@@ -31,7 +31,7 @@ def get_phishing_urls():
         return []
 
 
-async def process_url(url, semaphore):
+async def process_url(url, semaphore, on_ready=None):
     async with semaphore:
         parsed = urlparse(url)
         safe_domain = parsed.netloc.replace(":", "_").replace("/", "_")
@@ -65,25 +65,36 @@ async def process_url(url, semaphore):
             f.write(url)
 
         try:
-            # extract only, don't generate -- the sse endpoint handles streaming
-            # when a user opens the run page
-            await run_analysis(mac_folder)
+            prompt = await run_analysis(mac_folder)
+
+            # cache prompt so the generation worker doesn't re-run extraction
+            try:
+                with open(os.path.join(mac_folder, "prompt.txt"), "w", encoding="utf-8") as pf:
+                    pf.write(prompt)
+            except Exception:
+                pass
 
             if prisma.is_connected():
                 await prisma.analysisrun.update(where={'id': run_id}, data={'status': 'ready'})
             print(f"  -> ready for generation: {url}")
+
+            # notify api to queue generation
+            if on_ready:
+                await on_ready(run_id)
+
         except Exception as e:
             if prisma.is_connected():
                 await prisma.analysisrun.update(where={'id': run_id}, data={'status': 'failed', 'error': str(e)})
 
 
-async def start_feed(limit: int = 5):
+async def start_feed(limit: int = 5, on_ready=None):
     if not prisma.is_connected():
         await prisma.connect()
 
     start_ollama()
     print("fetching latest urls from openphish...")
     urls = get_phishing_urls()
+
     # dedupe against previously processed runs in the DB
     try:
         if prisma.is_connected():
@@ -91,7 +102,6 @@ async def start_feed(limit: int = 5):
             seen = set(r.url for r in existing if r.url)
             urls = [u for u in urls if u not in seen]
     except Exception:
-        # if anything goes wrong with DB lookup, fall back to raw feed
         pass
 
     print(f"retrieved {len(urls)} candidates after dedupe, processing top {limit}...")
@@ -102,7 +112,7 @@ async def start_feed(limit: int = 5):
 
     async def wrapped(url):
         try:
-            await asyncio.wait_for(process_url(url, semaphore), timeout=300)
+            await asyncio.wait_for(process_url(url, semaphore, on_ready), timeout=300)
         except asyncio.TimeoutError:
             print(f"  !! timed out: {url}")
         except Exception as e:

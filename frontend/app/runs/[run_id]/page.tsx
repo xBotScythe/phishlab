@@ -14,6 +14,7 @@ type RunData = {
   report: string | null;
   status: string;
   has_screenshot: boolean;
+  created_at: string | null;
   error?: string;
 };
 
@@ -119,7 +120,9 @@ export default function RunDetails() {
         </div>
         <div className="flex-between">
           <p className="text-[0.65rem] text-dim uppercase tracking-widest">
-            RUN_ID: {run_id}
+            {run.created_at
+              ? new Date(run.created_at).toLocaleString()
+              : `RUN_ID: ${run_id}`}
           </p>
           <div className="flex gap-2">
             {displayReport && (
