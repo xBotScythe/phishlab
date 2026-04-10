@@ -8,14 +8,12 @@ import threading
 import hashlib
 from pathlib import Path
 
-# config
 API_PORT = 8000
 FRONTEND_PORT = 3000
 BASE_DIR = Path(__file__).parent.absolute()
 FRONTEND_DIR = BASE_DIR / "frontend"
 VENV_DIR = BASE_DIR / "venv"
 
-# process state
 processes = []
 
 def log(tag, message):
@@ -25,10 +23,8 @@ def get_env_with_venv():
     env = os.environ.copy()
     venv_bin = str(VENV_DIR / "bin")
     
-    # system paths to ensure are present (order-sensitive prepending)
     paths = [venv_bin]
-    
-    # add brew path on mac
+
     if sys.platform == "darwin":
         brew_bin = "/opt/homebrew/bin"
         if os.path.exists(brew_bin):
@@ -67,12 +63,11 @@ def start_process(cmd, tag, cwd=BASE_DIR):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         bufsize=1,
-        text=True,  # binary mode fix
+        text=True,
         env=env
     )
     processes.append(process)
-    
-    # log streamer
+
     thread = threading.Thread(target=stream_logs, args=(process, tag), daemon=True)
     thread.start()
     return process
@@ -86,18 +81,18 @@ def cleanup(sig=None, frame=None):
         except:
             p.kill()
     
-    # stop docker? not for now
-    
     log("SYSTEM", "Good@bye.")
     sys.exit(0)
 
-# signals
 signal.signal(signal.SIGINT, cleanup)
 signal.signal(signal.SIGTERM, cleanup)
 
 DOCKER_IMAGE = "phishing-cage"
 DOCKER_TRACKED = ["Dockerfile", "detonate_url.py", "docker_requirements.txt"]
 DOCKER_HASH_FILE = BASE_DIR / ".docker_build_hash"
+FRONTEND_HASH_FILE = BASE_DIR / ".frontend_build_hash"
+FRONTEND_TRACKED_DIRS = ["app", "components", "prisma"]
+FRONTEND_TRACKED_FILES = ["package.json", "next.config.ts", "tsconfig.json", "tailwind.config.ts"]
 
 
 def _docker_source_hash() -> str:
@@ -133,6 +128,38 @@ def check_docker_image():
 
     DOCKER_HASH_FILE.write_text(current_hash)
     log("SETUP", "Docker image built successfully.")
+
+
+def _frontend_source_hash() -> str:
+    h = hashlib.sha256()
+    for name in FRONTEND_TRACKED_FILES:
+        path = FRONTEND_DIR / name
+        if path.exists():
+            h.update(path.read_bytes())
+    for dir_name in FRONTEND_TRACKED_DIRS:
+        for path in sorted((FRONTEND_DIR / dir_name).rglob("*")):
+            if path.is_file():
+                h.update(path.read_bytes())
+    return h.hexdigest()
+
+
+def check_frontend_build():
+    current_hash = _frontend_source_hash()
+    cached_hash = FRONTEND_HASH_FILE.read_text().strip() if FRONTEND_HASH_FILE.exists() else ""
+    next_dir = FRONTEND_DIR / ".next"
+
+    if next_dir.exists() and current_hash == cached_hash:
+        log("SETUP", "Frontend build is up to date.")
+        return
+
+    reason = "no build found" if not next_dir.exists() else "source files changed"
+    log("SETUP", f"Building frontend ({reason})...")
+    if not run_command(["npm", "run", "build"], cwd=FRONTEND_DIR):
+        log("ERROR", "Frontend build failed.")
+        sys.exit(1)
+
+    FRONTEND_HASH_FILE.write_text(current_hash)
+    log("SETUP", "Frontend built successfully.")
 
 
 def check_python_setup():
@@ -175,6 +202,7 @@ def main():
         log("SYSTEM", "Environment already configured. Skipping setup.")
 
     check_docker_image()
+    check_frontend_build()
 
     log("SYSTEM", "Starting Database (Docker)...")
     if not run_command(["docker", "compose", "up", "-d", "db"]):
@@ -190,7 +218,7 @@ def main():
         sys.exit(1)
 
     start_process([sys.executable, "-m", "uvicorn", "api:app", "--host", "0.0.0.0", "--port", str(API_PORT)], "API")
-    start_process(["npm", "run", "dev"], "FRONTEND", cwd=FRONTEND_DIR)
+    start_process(["npm", "run", "start"], "FRONTEND", cwd=FRONTEND_DIR)
 
     log("SYSTEM", "--------------------------------------------------")
     log("SYSTEM", f"API is available at: http://localhost:{API_PORT}")

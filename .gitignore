@@ -37,4 +37,4 @@ coverage/
 
 *.sqlite3
 *.db
-
+.docker_build_hash
