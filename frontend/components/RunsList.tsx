@@ -13,6 +13,8 @@ type Run = {
   has_report: boolean;
   has_screenshot: boolean;
   created_at: string | null;
+  vt_malicious: number | null;
+  campaign_id: string | null;
 };
 
 export default function RunsList({ limit }: { limit?: number }) {
@@ -136,8 +138,8 @@ export default function RunsList({ limit }: { limit?: number }) {
                   className="accent-[var(--purple)]"
                 />
               )}
-              <Link href={`/runs/${encodeURIComponent(run.id)}`} className="flex-1">
-                <div className="card px-4 py-3 flex items-center justify-between hover:bg-[var(--bg-raised)] transition-colors">
+              <Link href={`/runs/${encodeURIComponent(run.id)}`} className="flex-1 min-w-0">
+                <div className="card px-4 py-3 flex items-center justify-between hover:bg-[var(--bg-raised)] transition-colors overflow-hidden">
                   <div className="min-w-0 flex-1">
                     <p className="text-xs font-bold text-[var(--purple-bright)] truncate tracking-tight">
                       {run.url ?? "// UNKNOWN_TARGET"}
@@ -148,7 +150,17 @@ export default function RunsList({ limit }: { limit?: number }) {
                         : `ID: ${run.id}`}
                     </p>
                   </div>
-                  <div className="flex items-center gap-4 ml-4">
+                  <div className="flex items-center gap-3 ml-4">
+                    {run.vt_malicious != null && run.vt_malicious > 0 && (
+                      <span className="text-[0.6rem] uppercase tracking-widest text-[var(--error)]">
+                        VT:{run.vt_malicious}
+                      </span>
+                    )}
+                    {run.campaign_id && (
+                      <span className="text-[0.6rem] uppercase tracking-widest text-[var(--purple-bright)]">
+                        campaign
+                      </span>
+                    )}
                     <StatusBadge status={run.status} />
                   </div>
                 </div>

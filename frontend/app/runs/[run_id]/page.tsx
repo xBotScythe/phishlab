@@ -16,6 +16,12 @@ type RunData = {
   has_screenshot: boolean;
   created_at: string | null;
   error?: string;
+  vt_malicious: number | null;
+  vt_suspicious: number | null;
+  vt_total: number | null;
+  urlscan_score: number | null;
+  urlscan_id: string | null;
+  campaign_id: string | null;
 };
 
 export default function RunDetails() {
@@ -111,30 +117,61 @@ export default function RunDetails() {
   return (
     <div className="space-y-8">
       {/* header */}
-      <div className="border-b border-[var(--border)] pb-6">
-        <div className="flex-between mb-2">
+      <div className="border-b border-[var(--border)] pb-6 space-y-4">
+        <div className="flex-between">
           <h1 className="text-xl truncate flex-1">{run.url || "UNKNOWN_TARGET"}</h1>
           <div className="flex items-center gap-3">
             <StatusBadge status={status} />
           </div>
         </div>
-        <div className="flex-between">
+
+        <div className="flex-between flex-wrap gap-3">
           <p className="text-[0.65rem] text-dim uppercase tracking-widest">
-            {run.created_at
-              ? new Date(run.created_at).toLocaleString()
-              : `RUN_ID: ${run_id}`}
+            {run.created_at ? new Date(run.created_at).toLocaleString() : `RUN_ID: ${run_id}`}
           </p>
-          <div className="flex gap-2">
+          <div className="flex gap-2 flex-wrap">
             {displayReport && (
-              <button onClick={handleExport} className="btn-outline btn py-1 px-3 text-xs">
-                export .md
-              </button>
+              <>
+                <button onClick={handleExport} className="btn-outline btn py-1 px-3 text-xs">export .md</button>
+                <a href={`${API}/api/runs/${run_id}/export?format=csv`} download className="btn-outline btn py-1 px-3 text-xs">export .csv</a>
+                <a href={`${API}/api/runs/${run_id}/export?format=stix`} download className="btn-outline btn py-1 px-3 text-xs">export stix</a>
+              </>
             )}
-            <button onClick={handleDelete} className="btn-outline btn py-1 px-3 text-xs !border-[var(--error)] text-[var(--error)] hover:bg-[var(--error)] hover:text-white">
-              delete
-            </button>
+            <button onClick={handleDelete} className="btn-outline btn py-1 px-3 text-xs !border-[var(--error)] text-[var(--error)] hover:bg-[var(--error)] hover:text-white">delete</button>
           </div>
         </div>
+
+        {/* threat intel row — always shown for complete runs */}
+        {status === "complete" && (
+          <div className="flex gap-6 flex-wrap text-[0.65rem] uppercase tracking-widest">
+            {run.vt_total != null ? (
+              <span className={(run.vt_malicious ?? 0) > 0 ? "text-[var(--error)]" : "text-[var(--success)]"}>
+                VT: {run.vt_malicious ?? 0} malicious / {run.vt_suspicious ?? 0} suspicious / {run.vt_total} engines
+              </span>
+            ) : (
+              <span className="text-dim">VT: no data</span>
+            )}
+
+            {run.urlscan_id ? (
+              <a
+                href={`https://urlscan.io/result/${run.urlscan_id}/`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className={`hover:underline ${(run.urlscan_score ?? 0) > 50 ? "text-[var(--error)]" : "text-dim"}`}
+              >
+                urlscan: score {run.urlscan_score ?? 0} →
+              </a>
+            ) : (
+              <span className="text-dim">urlscan: no existing scan</span>
+            )}
+
+            {run.campaign_id && (
+              <span className="text-[var(--purple-bright)]">
+                campaign: {run.campaign_id.slice(0, 20)}
+              </span>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-8">

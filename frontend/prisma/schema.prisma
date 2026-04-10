@@ -13,14 +13,21 @@ datasource db {
 }
 
 model AnalysisRun {
-  id            String   @id
-  url           String?
-  status        String   @default("pending")
-  folder        String
-  report        String?  @db.Text
-  createdAt     DateTime @default(now())
-  hasScreenshot Boolean  @default(false)
-  error         String?
+  id             String   @id
+  url            String?
+  status         String   @default("pending")
+  folder         String
+  report         String?  @db.Text
+  createdAt      DateTime @default(now())
+  hasScreenshot  Boolean  @default(false)
+  error          String?
+  vtMalicious    Int?
+  vtSuspicious   Int?
+  vtTotal        Int?
+  urlscanScore   Float?
+  urlscanId      String?
+  screenshotHash String?
+  campaignId     String?
 }
 
 model FeedStatus {

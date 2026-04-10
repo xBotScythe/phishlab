@@ -165,21 +165,79 @@ a:hover {
 /* report details */
 .report-content {
   font-size: 0.9rem;
-  line-height: 1.6;
+  line-height: 1.7;
 }
 
-.report-content h2 {
-  border-bottom: 1px solid var(--border);
-  padding-bottom: 0.5rem;
-  margin-top: 2rem;
-  font-size: 1.1rem;
+.report-content p {
+  margin: 0.75rem 0;
+}
+
+.report-content h1,
+.report-content h2,
+.report-content h3,
+.report-content h4 {
+  margin-top: 1.75rem;
+  margin-bottom: 0.5rem;
   color: var(--purple-bright);
 }
+
+.report-content h1 { font-size: 1.2rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+.report-content h2 { font-size: 1.1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.4rem; }
+.report-content h3 { font-size: 1rem; }
+.report-content h4 { font-size: 0.9rem; }
+
+.report-content ul,
+.report-content ol {
+  padding-left: 1.5rem;
+  margin: 0.75rem 0;
+}
+
+.report-content ul { list-style: disc; }
+.report-content ol { list-style: decimal; }
+.report-content li { margin: 0.3rem 0; }
+
+.report-content strong { color: var(--text-bright); font-weight: 600; }
+.report-content em { opacity: 0.85; font-style: italic; }
+
+.report-content hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 1.5rem 0;
+}
+
+.report-content table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0;
+  font-size: 0.8rem;
+  table-layout: fixed;
+}
+
+.report-content th {
+  text-align: left;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--purple);
+  color: var(--purple-bright);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 0.7rem;
+}
+
+.report-content td {
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+  word-break: break-word;
+  overflow-wrap: break-word;
+}
+
+.report-content tr:last-child td { border-bottom: none; }
 
 .report-content code {
   background: var(--bg-raised);
   padding: 0.1rem 0.3rem;
   color: var(--purple-bright);
+  font-size: 0.85em;
 }
 
 .report-content pre {
@@ -187,6 +245,24 @@ a:hover {
   padding: 1rem;
   border: 1px solid var(--border);
   overflow-x: auto;
+}
+
+.report-content pre code {
+  background: none;
+  padding: 0;
+  color: inherit;
+}
+
+.report-content blockquote {
+  border-left: 2px solid var(--purple);
+  padding-left: 1rem;
+  margin: 1rem 0;
+  opacity: 0.8;
+}
+
+.report-content a {
+  color: var(--purple-bright);
+  text-decoration: underline;
 }
 
 /* utilities */

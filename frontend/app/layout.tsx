@@ -28,6 +28,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             <nav className="flex gap-6 text-xs uppercase tracking-widest text-[var(--text-dim)]">
               <Link href="/" className="hover:text-[var(--text-bright)]">/ dashboard</Link>
               <Link href="/detonate" className="hover:text-[var(--text-bright)]">/ detonate</Link>
+              <Link href="/campaigns" className="hover:text-[var(--text-bright)]">/ campaigns</Link>
             </nav>
           </div>
         </header>
