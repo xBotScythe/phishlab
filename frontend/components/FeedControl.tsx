@@ -98,7 +98,10 @@ export default function FeedControl() {
 
       {status.last_run && !status.active && (
         <div className="pt-4 border-t border-[var(--border)] text-[0.65rem] text-dim uppercase tracking-widest">
-          last_ingestion_finished: {new Date(status.last_run).toLocaleString()}
+          last_ingestion_finished: {(() => {
+            const d = new Date(status.last_run);
+            return isNaN(d.getTime()) ? "unknown" : d.toLocaleString();
+          })()}
         </div>
       )}
     </div>
