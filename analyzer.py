@@ -45,19 +45,25 @@ async def run_analysis(output_dir: str) -> str:
                     session.call_tool("analyze_domain", {"target_url": target_url}),
                     timeout=timeout_sec
                 )),
+                asyncio.create_task(asyncio.wait_for(
+                    session.call_tool("analyze_js_runtime", {"folder": output_dir}),
+                    timeout=timeout_sec
+                )),
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            # log timeouts or errors for diagnostics
             for idx, r in enumerate(results):
                 if isinstance(r, asyncio.TimeoutError):
                     print(f"MCP tool {idx} timed out after {timeout_sec}s")
                 elif isinstance(r, Exception):
                     print(f"MCP tool {idx} error: {r}")
 
-            har_data = results[0].content[0].text if not isinstance(results[0], Exception) else f"failed to extract HAR data: {results[0]}"
-            dom_data = results[1].content[0].text if not isinstance(results[1], Exception) else f"failed to extract DOM data: {results[1]}"
-            domain_data = results[2].content[0].text if not isinstance(results[2], Exception) else f"failed to extract domain OSINT: {results[2]}"
+            def _text(r): return r.content[0].text if not isinstance(r, Exception) else f"tool error: {r}"
+
+            har_data    = _text(results[0])
+            dom_data    = _text(results[1])
+            domain_data = _text(results[2])
+            js_data     = _text(results[3])
 
             return f"""Analyze the following phishing threat data extracted from a target URL.
 
@@ -69,6 +75,9 @@ HAR Network Analysis:
 
 HTML DOM Indicators of Compromise (includes Brand, Decoy Links, and Obfuscation):
 {dom_data}
+
+JavaScript Runtime Analysis (kit globals, storage, inline scripts, final URL):
+{js_data}
 
 Instructions for Formatting:
 1. DO NOT include hallucinated metadata such as "Analyst Name", "Date", or "Source". Start the report immediately.

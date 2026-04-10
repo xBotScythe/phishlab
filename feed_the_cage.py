@@ -8,6 +8,8 @@ import datetime
 from analyzer import run_analysis
 from detonation import run_container
 from ollama_manager import start_ollama
+from threat_intel import run_threat_intel, format_intel_section
+from clustering import compute_screenshot_hash
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CAGEDROP = os.path.join(BASE_DIR, "CageDrop")
@@ -57,25 +59,37 @@ async def get_urls() -> tuple[list[str], str]:
 
 
 def is_reachable(url: str) -> bool:
-    """quick head check — skip urls where the server isn't responding"""
-    try:
-        resp = requests.head(
-            url,
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=5,
-            allow_redirects=True,
-        )
-        return resp.status_code < 500
-    except Exception:
-        return False
+    """head check with get fallback — some servers ignore HEAD"""
+    for method in (requests.head, requests.get):
+        try:
+            resp = method(
+                url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=5,
+                allow_redirects=True,
+                stream=True,
+            )
+            resp.close()
+            return resp.status_code < 500
+        except Exception:
+            continue
+    return False
+
+
+async def filter_live(urls: list[str]) -> list[str]:
+    """check reachability for all urls concurrently, return only live ones"""
+    async def check(url):
+        alive = await asyncio.to_thread(is_reachable, url)
+        if not alive:
+            print(f"  -- dead: {url}")
+        return url if alive else None
+
+    results = await asyncio.gather(*[check(u) for u in urls])
+    return [u for u in results if u]
 
 
 async def process_url(url, semaphore, on_ready=None):
     async with semaphore:
-        if not await asyncio.to_thread(is_reachable, url):
-            print(f"  -- skipping unreachable: {url}")
-            return
-
         parsed = urlparse(url)
         safe_domain = parsed.netloc.replace(":", "_").replace("/", "_")
         timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
@@ -103,18 +117,25 @@ async def process_url(url, semaphore, on_ready=None):
                 )
             return
 
-        print(f"  -> extracting: {url}")
         if prisma.is_connected():
             await prisma.analysisrun.update(
                 where={"id": run_id},
                 data={"status": "extracting", "hasScreenshot": True},
             )
 
+        # screenshot hash for clustering
+        phash = await compute_screenshot_hash(mac_folder)
+
         with open(os.path.join(mac_folder, "target.txt"), "w") as f:
             f.write(url)
 
         try:
-            prompt = await run_analysis(mac_folder)
+            print(f"  -> extracting + intel: {url}")
+            prompt, intel = await asyncio.gather(
+                run_analysis(mac_folder),
+                run_threat_intel(url),
+            )
+            prompt += format_intel_section(intel)
 
             try:
                 with open(os.path.join(mac_folder, "prompt.txt"), "w", encoding="utf-8") as pf:
@@ -123,11 +144,22 @@ async def process_url(url, semaphore, on_ready=None):
                 pass
 
             if prisma.is_connected():
-                await prisma.analysisrun.update(
-                    where={"id": run_id}, data={"status": "queued"}
-                )
-            print(f"  -> ready for generation: {url}")
+                vt = intel.get("virustotal")
+                us = intel.get("urlscan")
+                intel_update: dict = {"status": "queued"}
+                if phash:
+                    intel_update["screenshotHash"] = phash
+                if vt:
+                    intel_update.update({
+                        "vtMalicious": vt["malicious"],
+                        "vtSuspicious": vt["suspicious"],
+                        "vtTotal": vt["malicious"] + vt["suspicious"] + vt["harmless"] + vt["undetected"],
+                    })
+                if us:
+                    intel_update.update({"urlscanScore": float(us["score"]), "urlscanId": us["uuid"]})
+                await prisma.analysisrun.update(where={"id": run_id}, data=intel_update)
 
+            print(f"  -> queued for generation: {url}")
             if on_ready:
                 await on_ready(run_id)
 
@@ -156,8 +188,12 @@ async def start_feed(limit: int = 5, on_ready=None):
     except Exception:
         pass
 
-    print(f"{len(urls)} candidates after dedupe, processing top {limit}...")
-    subset = urls[:limit]
+    # check more than needed so dead sites don't eat into the limit
+    candidates = urls[:limit * 5]
+    print(f"checking reachability for {len(candidates)} candidates...")
+    live = await filter_live(candidates)
+    subset = live[:limit]
+    print(f"{len(subset)} live urls to detonate")
 
     semaphore = asyncio.Semaphore(3)
 

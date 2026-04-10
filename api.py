@@ -5,6 +5,13 @@ import os
 import shutil
 from urllib.parse import urlparse
 
+# load .env before anything else so api keys are available
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 os.environ.setdefault("OLLAMA_HOST", "127.0.0.1:11434")
 
 import ollama
@@ -18,6 +25,9 @@ from analyzer import run_analysis, MODEL
 from detonation import run_container
 from ollama_manager import start_ollama, stop_ollama
 from feed_the_cage import start_feed
+from threat_intel import run_threat_intel, format_intel_section
+from clustering import compute_screenshot_hash, find_campaign
+from ioc_export import collect_iocs, export_csv, export_stix
 from prisma import Prisma
 
 app = FastAPI(title="PhishLab API", version="1.0.0")
@@ -72,10 +82,18 @@ async def _generate_report(run_id: str):
             return
 
     try:
+        message: dict = {"role": "user", "content": prompt}
+
+        # attach screenshot if available — gemma4 is vision-capable
+        screenshot_path = os.path.join(run.folder, "screenshot.png")
+        if os.path.exists(screenshot_path):
+            with open(screenshot_path, "rb") as img_f:
+                message["images"] = [img_f.read()]
+
         response = await asyncio.to_thread(
             ollama.chat,
             model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[message],
             keep_alive="10m",
         )
         report = response.message.content
@@ -88,6 +106,13 @@ async def _generate_report(run_id: str):
             'report': report
         })
         print(f"GENERATE: finished report for {run_id}")
+
+        # assign campaign after report is complete
+        completed = await prisma.analysisrun.find_unique(where={'id': run_id})
+        if completed and completed.screenshotHash:
+            campaign_id = await find_campaign(prisma, run_id, completed.screenshotHash, completed.url or "")
+            if campaign_id:
+                await prisma.analysisrun.update(where={'id': run_id}, data={'campaignId': campaign_id})
     except Exception as e:
         await prisma.analysisrun.update(where={'id': run_id}, data={
             'status': 'failed',
@@ -167,8 +192,7 @@ def sse(event_type: str, content: str) -> str:
 
 
 def _detonation_complete(folder: str) -> bool:
-    """check if the container finished writing its artifacts cleanly"""
-    return os.path.exists(os.path.join(folder, "extracted_iocs.json"))
+    return os.path.exists(os.path.join(folder, "screenshot.png"))
 
 
 def _extraction_complete(folder: str) -> bool:
@@ -187,7 +211,7 @@ async def _run_detonation(run_id: str, url: str):
             f.write(url)
 
         if _detonation_complete(run.folder):
-            print(f"RESUME: skipping detonation for {run_id}, artifacts found on disk")
+            print(f"RESUME: skipping detonation for {run_id}")
             await prisma.analysisrun.update(where={'id': run_id}, data={'hasScreenshot': True})
         else:
             await prisma.analysisrun.update(where={'id': run_id}, data={'status': 'detonating'})
@@ -200,18 +224,40 @@ async def _run_detonation(run_id: str, url: str):
                 return
             await prisma.analysisrun.update(where={'id': run_id}, data={'hasScreenshot': True})
 
+        # compute screenshot hash for campaign clustering (after detonation)
+        phash = await compute_screenshot_hash(run.folder)
+        if phash:
+            await prisma.analysisrun.update(where={'id': run_id}, data={'screenshotHash': phash})
+
         if _extraction_complete(run.folder):
-            print(f"RESUME: skipping extraction for {run_id}, prompt.txt found on disk")
+            print(f"RESUME: skipping extraction for {run_id}")
         else:
             await prisma.analysisrun.update(where={'id': run_id}, data={'status': 'extracting'})
-            prompt = await run_analysis(run.folder)
+            # run mcp extraction and threat intel concurrently
+            prompt, intel = await asyncio.gather(
+                run_analysis(run.folder),
+                run_threat_intel(url),
+            )
+            prompt += format_intel_section(intel)
+            vt = intel.get("virustotal")
+            us = intel.get("urlscan")
+            intel_update = {}
+            if vt:
+                intel_update.update({
+                    'vtMalicious': vt['malicious'],
+                    'vtSuspicious': vt['suspicious'],
+                    'vtTotal': vt['malicious'] + vt['suspicious'] + vt['harmless'] + vt['undetected'],
+                })
+            if us:
+                intel_update.update({'urlscanScore': float(us['score']), 'urlscanId': us['uuid']})
+            if intel_update:
+                await prisma.analysisrun.update(where={'id': run_id}, data=intel_update)
             try:
                 with open(os.path.join(run.folder, "prompt.txt"), "w", encoding="utf-8") as pf:
                     pf.write(prompt)
             except Exception:
                 pass
 
-        # stage 3: queue for generation (worker serializes via ollama_lock)
         await prisma.analysisrun.update(where={'id': run_id}, data={'status': 'queued'})
         await generation_queue.put(run_id)
 
@@ -341,6 +387,8 @@ async def list_runs(q: str = "", status: str = ""):
             "has_report": run.report is not None,
             "has_screenshot": run.hasScreenshot,
             "created_at": run.createdAt.isoformat() if run.createdAt else None,
+            "vt_malicious": run.vtMalicious,
+            "campaign_id": run.campaignId,
         })
     return {"runs": results}
 
@@ -358,7 +406,13 @@ async def get_run(run_id: str):
         "status": run.status,
         "has_screenshot": run.hasScreenshot,
         "created_at": run.createdAt.isoformat() if run.createdAt else None,
-        "files": os.listdir(run.folder) if os.path.exists(run.folder) else []
+        "files": os.listdir(run.folder) if os.path.exists(run.folder) else [],
+        "vt_malicious": run.vtMalicious,
+        "vt_suspicious": run.vtSuspicious,
+        "vt_total": run.vtTotal,
+        "urlscan_score": run.urlscanScore,
+        "urlscan_id": run.urlscanId,
+        "campaign_id": run.campaignId,
     }
 
 
@@ -383,7 +437,55 @@ async def get_screenshot(run_id: str):
     return FileResponse(path, media_type="image/png")
 
 
-# --- feed ingestion ---
+@app.get("/api/runs/{run_id}/export")
+async def export_iocs(run_id: str, format: str = "csv"):
+    run = await prisma.analysisrun.find_unique(where={'id': run_id})
+    if not run:
+        raise HTTPException(status_code=404, detail="run not found")
+
+    iocs = collect_iocs(run.folder, run.url or "", run.report or "")
+
+    if format == "stix":
+        content = export_stix(iocs, run_id, run.url or "")
+        return StreamingResponse(
+            iter([content]),
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="phishlab_{run_id}.stix.json"'},
+        )
+    else:
+        content = export_csv(iocs, run_id)
+        return StreamingResponse(
+            iter([content]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="phishlab_{run_id}.csv"'},
+        )
+
+
+@app.get("/api/campaigns")
+async def list_campaigns():
+    runs = await prisma.analysisrun.find_many(
+        where={"campaignId": {"not": None}, "status": "complete"},
+        order={"createdAt": "desc"},
+    )
+    campaigns: dict = {}
+    for run in runs:
+        cid = run.campaignId
+        if cid not in campaigns:
+            campaigns[cid] = {
+                "campaign_id": cid,
+                "run_count": 0,
+                "runs": [],
+                "first_seen": run.createdAt.isoformat() if run.createdAt else None,
+                "last_seen": run.createdAt.isoformat() if run.createdAt else None,
+            }
+        campaigns[cid]["run_count"] += 1
+        campaigns[cid]["last_seen"] = run.createdAt.isoformat() if run.createdAt else None
+        campaigns[cid]["runs"].append({
+            "id": run.id,
+            "url": run.url,
+            "created_at": run.createdAt.isoformat() if run.createdAt else None,
+        })
+    return {"campaigns": list(campaigns.values())}
 
 async def _run_feed_background(limit: int):
     print(f"INFO: starting automated feed ingestion (limit={limit})")

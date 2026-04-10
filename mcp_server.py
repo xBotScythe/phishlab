@@ -331,5 +331,61 @@ def analyze_domain(target_url: str) -> str:
     except Exception as e:
         return f"failed to analyze domain: {e}"
 
+@mcp.tool()
+def analyze_js_runtime(folder: str) -> str:
+    """analyze js runtime artifacts: kit globals, storage, inline scripts, final url"""
+    if not is_safe_path(folder):
+        return "error: path outside allowed directory"
+
+    path = os.path.join(folder, "js_runtime.json")
+    if not os.path.exists(path):
+        return "js_runtime.json not found — container may predate this feature"
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        return f"failed to read js_runtime.json: {e}"
+
+    result = {}
+
+    final_url = data.get("finalUrl", "")
+    result["final_url"] = final_url
+
+    kit_globals = data.get("kitGlobals", [])
+    if kit_globals:
+        result["kit_globals"] = kit_globals
+
+    ls = data.get("localStorage", {})
+    if ls:
+        result["local_storage"] = ls
+
+    ss = data.get("sessionStorage", {})
+    if ss:
+        result["session_storage"] = ss
+
+    cookies = data.get("cookieNames", [])
+    if cookies:
+        result["cookie_names"] = cookies
+
+    lang = data.get("pageLanguage", "")
+    if lang:
+        result["page_language"] = lang
+
+    # flag inline scripts that look obfuscated
+    suspicious_inline = []
+    for script in data.get("inlineScripts", []):
+        # high ratio of non-alphanumeric chars = likely obfuscated
+        non_alnum = sum(1 for c in script if not c.isalnum() and c not in (' ', '\n', '\t'))
+        ratio = non_alnum / max(len(script), 1)
+        if ratio > 0.3 or 'eval(' in script or 'unescape(' in script or 'atob(' in script:
+            suspicious_inline.append(script[:300])
+
+    if suspicious_inline:
+        result["suspicious_inline_scripts"] = suspicious_inline
+
+    return json.dumps(result, indent=2)
+
+
 if __name__ == "__main__":
     mcp.run()

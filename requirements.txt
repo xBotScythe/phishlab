@@ -19,3 +19,10 @@ python-whois
 
 # database
 prisma
+
+# env file loading
+python-dotenv
+
+# campaign clustering (screenshot perceptual hashing)
+imagehash
+Pillow

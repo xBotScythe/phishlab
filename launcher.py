@@ -5,6 +5,7 @@ import time
 import signal
 import shutil
 import threading
+import hashlib
 from pathlib import Path
 
 # config
@@ -94,7 +95,46 @@ def cleanup(sig=None, frame=None):
 signal.signal(signal.SIGINT, cleanup)
 signal.signal(signal.SIGTERM, cleanup)
 
-# setup logic
+DOCKER_IMAGE = "phishing-cage"
+DOCKER_TRACKED = ["Dockerfile", "detonate_url.py", "docker_requirements.txt"]
+DOCKER_HASH_FILE = BASE_DIR / ".docker_build_hash"
+
+
+def _docker_source_hash() -> str:
+    h = hashlib.sha256()
+    for name in DOCKER_TRACKED:
+        path = BASE_DIR / name
+        if path.exists():
+            h.update(path.read_bytes())
+    return h.hexdigest()
+
+
+def _image_exists() -> bool:
+    result = subprocess.run(
+        ["docker", "images", "-q", DOCKER_IMAGE],
+        capture_output=True, text=True
+    )
+    return bool(result.stdout.strip())
+
+
+def check_docker_image():
+    current_hash = _docker_source_hash()
+    cached_hash = DOCKER_HASH_FILE.read_text().strip() if DOCKER_HASH_FILE.exists() else ""
+
+    if _image_exists() and current_hash == cached_hash:
+        log("SETUP", f"Docker image '{DOCKER_IMAGE}' is up to date.")
+        return
+
+    reason = "image not found" if not _image_exists() else "source files changed"
+    log("SETUP", f"Building Docker image '{DOCKER_IMAGE}' ({reason})...")
+    if not run_command(["docker", "build", "-t", DOCKER_IMAGE, "."]):
+        log("ERROR", "Docker build failed. Detonation will not work.")
+        sys.exit(1)
+
+    DOCKER_HASH_FILE.write_text(current_hash)
+    log("SETUP", "Docker image built successfully.")
+
+
 def check_python_setup():
     try:
         import fastapi
@@ -108,14 +148,12 @@ def check_node_setup():
     return (FRONTEND_DIR / "node_modules").exists()
 
 def perform_setup():
-    # python deps
     if not check_python_setup():
         log("SETUP", "Python dependencies missing. Installing...")
         run_command([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
     else:
         log("SETUP", "Python dependencies already satisfied.")
-    
-    # node deps
+
     if not check_node_setup():
         log("SETUP", "Frontend dependencies missing. Running npm install...")
         if not run_command(["npm", "install"], cwd=FRONTEND_DIR):
@@ -124,11 +162,9 @@ def perform_setup():
     else:
         log("SETUP", "Frontend dependencies already satisfied.")
 
-# main entry
 def main():
     log("SYSTEM", "Initializing PhishLab Environment...")
 
-    # init check
     python_ok = check_python_setup()
     node_ok = check_node_setup()
 
@@ -137,30 +173,23 @@ def main():
         perform_setup()
     else:
         log("SYSTEM", "Environment already configured. Skipping setup.")
-    
-    # database (docker)
+
+    check_docker_image()
+
     log("SYSTEM", "Starting Database (Docker)...")
     if not run_command(["docker", "compose", "up", "-d", "db"]):
         log("ERROR", "Failed to start Docker. Is Docker Desktop running?")
         sys.exit(1)
-    
-    # wait for db
+
     time.sleep(2)
 
-    # sync schema
     log("SYSTEM", "Syncing Database Schema (Prisma)...")
     schema_path = str(FRONTEND_DIR / "prisma" / "schema.prisma")
     if not run_command(["npx", "prisma@5.17.0", "db", "push", "--schema", schema_path], cwd=FRONTEND_DIR, shell=False):
         log("ERROR", "Prisma sync failed.")
         sys.exit(1)
-    
-    # core services
-    log("SYSTEM", "Launching Core Services...")
-    
-    # api (uvicorn)
+
     start_process([sys.executable, "-m", "uvicorn", "api:app", "--host", "0.0.0.0", "--port", str(API_PORT)], "API")
-    
-    # frontend (next.js)
     start_process(["npm", "run", "dev"], "FRONTEND", cwd=FRONTEND_DIR)
 
     log("SYSTEM", "--------------------------------------------------")
@@ -169,7 +198,6 @@ def main():
     log("SYSTEM", "Press CTRL+C to stop all services.")
     log("SYSTEM", "--------------------------------------------------")
 
-    # keep alive
     while True:
         time.sleep(1)
 
