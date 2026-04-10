@@ -29,3 +29,8 @@ model FeedStatus {
   lastRun   DateTime?
   batchSize Int      @default(5)
 }
+
+model Settings {
+  id           Int     @id @default(1)
+  phishtankKey String? @default("")
+}

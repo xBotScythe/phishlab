@@ -45,6 +45,9 @@ class DetonateRequest(BaseModel):
 class FeedRequest(BaseModel):
     limit: int = 5
 
+class SettingsRequest(BaseModel):
+    phishtank_key: str = ""
+
 
 # --- generation worker ---
 
@@ -432,3 +435,19 @@ async def get_feed_status():
         "last_run": status.lastRun.isoformat() if status.lastRun else None,
         "batch_size": status.batchSize
     }
+
+
+
+@app.get("/api/settings")
+async def get_settings():
+    settings = await prisma.settings.find_unique(where={'id': 1})
+    return {"phishtank_key": settings.phishtankKey if settings else ""}
+
+@app.put("/api/settings")
+async def update_settings(req: SettingsRequest):
+    settings = await prisma.settings.find_unique(where={'id': 1})
+    if settings:
+        await prisma.settings.update(where={'id': 1}, data={'phishtankKey': req.phishtank_key})
+    else:
+        await prisma.settings.create(data={'id': 1, 'phishtankKey': req.phishtank_key})
+    return {"message": "settings saved"}
