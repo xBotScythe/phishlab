@@ -1,4 +1,4 @@
-# feed ingestion pipeline — phishtank (with key) or openphish (fallback)
+# feed ingestion pipeline — phishstats (primary) or openphish (fallback)
 import os
 import requests
 import asyncio
@@ -15,16 +15,16 @@ CAGEDROP = os.path.join(BASE_DIR, "CageDrop")
 from prisma import Prisma
 prisma = Prisma()
 
-PHISHTANK_FEED = "https://data.phishtank.com/data/{key}/online-valid.json"
+PHISHSTATS_FEED = "https://api.phishstats.info/api/phishing?_size=100"
 OPENPHISH_FEED = "https://openphish.com/feed.txt"
 
 
-def get_phishtank_urls(api_key: str) -> list[str]:
+def get_phishstats_urls() -> list[str]:
     try:
         resp = requests.get(
-            PHISHTANK_FEED.format(key=api_key),
-            headers={"User-Agent": "PhishLab/1.0 phishing-analysis-tool"},
-            timeout=30,
+            PHISHSTATS_FEED,
+            headers={"User-Agent": "PhishLab/1.0"},
+            timeout=15,
         )
         if resp.status_code == 200:
             return [e["url"] for e in resp.json() if e.get("url")]
@@ -47,20 +47,35 @@ def get_openphish_urls() -> list[str]:
         return []
 
 
-async def get_urls(api_key: str = "") -> tuple[list[str], str]:
-    """return (urls, source) using phishtank if key is set, else openphish"""
-    if api_key:
-        urls = await asyncio.to_thread(get_phishtank_urls, api_key)
-        if urls:
-            return urls, "phishtank"
-        print("phishtank fetch failed, falling back to openphish")
-
+async def get_urls() -> tuple[list[str], str]:
+    urls = await asyncio.to_thread(get_phishstats_urls)
+    if urls:
+        return urls, "phishstats"
+    print("phishstats fetch failed, falling back to openphish")
     urls = await asyncio.to_thread(get_openphish_urls)
     return urls, "openphish"
 
 
+def is_reachable(url: str) -> bool:
+    """quick head check — skip urls where the server isn't responding"""
+    try:
+        resp = requests.head(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=5,
+            allow_redirects=True,
+        )
+        return resp.status_code < 500
+    except Exception:
+        return False
+
+
 async def process_url(url, semaphore, on_ready=None):
     async with semaphore:
+        if not await asyncio.to_thread(is_reachable, url):
+            print(f"  -- skipping unreachable: {url}")
+            return
+
         parsed = urlparse(url)
         safe_domain = parsed.netloc.replace(":", "_").replace("/", "_")
         timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
@@ -109,7 +124,7 @@ async def process_url(url, semaphore, on_ready=None):
 
             if prisma.is_connected():
                 await prisma.analysisrun.update(
-                    where={"id": run_id}, data={"status": "ready"}
+                    where={"id": run_id}, data={"status": "queued"}
                 )
             print(f"  -> ready for generation: {url}")
 
@@ -129,16 +144,7 @@ async def start_feed(limit: int = 5, on_ready=None):
 
     start_ollama()
 
-    # pull api key from settings if available
-    api_key = ""
-    try:
-        settings = await prisma.settings.find_unique(where={"id": 1})
-        if settings and settings.phishtankKey:
-            api_key = settings.phishtankKey
-    except Exception:
-        pass
-
-    urls, source = await get_urls(api_key)
+    urls, source = await get_urls()
     print(f"fetched {len(urls)} urls from {source}")
 
     # dedupe against previously processed runs

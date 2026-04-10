@@ -45,8 +45,6 @@ class DetonateRequest(BaseModel):
 class FeedRequest(BaseModel):
     limit: int = 5
 
-class SettingsRequest(BaseModel):
-    phishtank_key: str = ""
 
 
 # --- generation worker ---
@@ -54,7 +52,7 @@ class SettingsRequest(BaseModel):
 async def _generate_report(run_id: str):
     """generate llm report for a single run. called by the queue worker."""
     run = await prisma.analysisrun.find_unique(where={'id': run_id})
-    if not run or run.status not in ('ready', 'generating'):
+    if not run or run.status not in ('queued', 'generating'):
         return
 
     await prisma.analysisrun.update(where={'id': run_id}, data={'status': 'generating'})
@@ -118,7 +116,7 @@ async def startup():
     except Exception as e:
         print(f"ERROR: failed to connect to database: {e}")
 
-    # reset stuck feed status from previous run
+    # clear any leftover active feed status from a previous crash
     try:
         status = await prisma.feedstatus.find_unique(where={'id': 1})
         if not status:
@@ -131,13 +129,12 @@ async def startup():
     start_ollama()
     os.makedirs(CAGEDROP, exist_ok=True)
 
-    # start the generation worker
     asyncio.create_task(_generation_worker())
 
-    # pick up any runs left in ready/generating from a previous crash
+    # re-queue runs that were mid-generation when the server went down
     try:
         stuck = await prisma.analysisrun.find_many(
-            where={'status': {'in': ['ready', 'generating']}},
+            where={'status': {'in': ['queued', 'generating']}},
             order={'createdAt': 'asc'}
         )
         for run in stuck:
@@ -146,8 +143,7 @@ async def startup():
     except Exception:
         pass
 
-    # pick up runs stuck mid-pipeline (detonation or extraction). _run_detonation
-    # is resume-aware and will skip whichever stages already have artifacts on disk.
+    # resume runs stuck mid-detonation or mid-extraction
     try:
         early_stuck = await prisma.analysisrun.find_many(
             where={'status': {'in': ['pending', 'detonating', 'extracting']}},
@@ -155,7 +151,7 @@ async def startup():
         )
         for run in early_stuck:
             if run.url:
-                print(f"STARTUP: resuming stuck run {run.id} from disk artifacts")
+                print(f"STARTUP: resuming {run.id}")
                 asyncio.create_task(_run_detonation(run.id, run.url))
     except Exception:
         pass
@@ -187,11 +183,9 @@ async def _run_detonation(run_id: str, url: str):
         return
 
     try:
-        # always ensure target.txt exists (cheap, idempotent)
         with open(os.path.join(run.folder, "target.txt"), "w") as f:
             f.write(url)
 
-        # stage 1: detonation (skip if artifacts already present)
         if _detonation_complete(run.folder):
             print(f"RESUME: skipping detonation for {run_id}, artifacts found on disk")
             await prisma.analysisrun.update(where={'id': run_id}, data={'hasScreenshot': True})
@@ -206,7 +200,6 @@ async def _run_detonation(run_id: str, url: str):
                 return
             await prisma.analysisrun.update(where={'id': run_id}, data={'hasScreenshot': True})
 
-        # stage 2: mcp extraction (skip if prompt already cached)
         if _extraction_complete(run.folder):
             print(f"RESUME: skipping extraction for {run_id}, prompt.txt found on disk")
         else:
@@ -219,7 +212,7 @@ async def _run_detonation(run_id: str, url: str):
                 pass
 
         # stage 3: queue for generation (worker serializes via ollama_lock)
-        await prisma.analysisrun.update(where={'id': run_id}, data={'status': 'ready'})
+        await prisma.analysisrun.update(where={'id': run_id}, data={'status': 'queued'})
         await generation_queue.put(run_id)
 
     except Exception as e:
@@ -398,7 +391,6 @@ async def _run_feed_background(limit: int):
         if prisma.is_connected():
             await prisma.feedstatus.update(where={'id': 1}, data={'active': True, 'batchSize': limit})
 
-        # pass callback so each ready run gets queued immediately
         async def on_ready(run_id):
             await generation_queue.put(run_id)
 
@@ -436,18 +428,3 @@ async def get_feed_status():
         "batch_size": status.batchSize
     }
 
-
-
-@app.get("/api/settings")
-async def get_settings():
-    settings = await prisma.settings.find_unique(where={'id': 1})
-    return {"phishtank_key": settings.phishtankKey if settings else ""}
-
-@app.put("/api/settings")
-async def update_settings(req: SettingsRequest):
-    settings = await prisma.settings.find_unique(where={'id': 1})
-    if settings:
-        await prisma.settings.update(where={'id': 1}, data={'phishtankKey': req.phishtank_key})
-    else:
-        await prisma.settings.create(data={'id': 1, 'phishtankKey': req.phishtank_key})
-    return {"message": "settings saved"}

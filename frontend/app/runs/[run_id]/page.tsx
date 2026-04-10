@@ -142,7 +142,7 @@ export default function RunDetails() {
         <section className="space-y-4">
           <h3 className="text-xs uppercase tracking-widest text-dim font-bold">visual_capture</h3>
           <div className="card !p-0 overflow-hidden min-h-[300px] flex items-center justify-center bg-[var(--bg-raised)] border-[var(--border)] relative">
-            {status === "complete" || status === "generating" || status === "ready" || status === "extracting" || run.has_screenshot ? (
+            {status === "complete" || status === "generating" || status === "queued" || status === "extracting" || run.has_screenshot ? (
               <img
                 src={`${API}/api/runs/${run_id}/screenshot`}
                 alt="screenshot"

@@ -57,7 +57,7 @@ export default function FeedControl() {
         <div>
           <h2 className="text-sm font-bold text-[var(--purple-bright)] uppercase tracking-tight">automated_ingestion</h2>
           <p className="text-xs text-dim mt-1">
-            source: open_phish // active: <span className={status.active ? "text-[var(--success)]" : "text-dim"}>{status.active ? "READY" : "IDLE"}</span>
+            source: phishstats // active: <span className={status.active ? "text-[var(--success)]" : "text-dim"}>{status.active ? "READY" : "IDLE"}</span>
           </p>
         </div>
 

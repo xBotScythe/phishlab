@@ -96,6 +96,7 @@ export default function RunsList({ limit }: { limit?: number }) {
           <option value="pending">pending</option>
           <option value="detonating">detonating</option>
           <option value="extracting">extracting</option>
+          <option value="queued">queued</option>
           <option value="generating">generating</option>
         </select>
         <button

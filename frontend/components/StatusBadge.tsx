@@ -1,6 +1,6 @@
 // shared status badge with pulse animation for active states
 
-const ACTIVE_STATES = ["pending", "detonating", "extracting", "generating", "ready"];
+const ACTIVE_STATES = ["pending", "detonating", "extracting", "queued", "generating"];
 
 export default function StatusBadge({ status }: { status: string }) {
   const isActive = ACTIVE_STATES.includes(status);
