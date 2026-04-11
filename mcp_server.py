@@ -5,6 +5,7 @@ import os
 import re
 import ssl
 import socket
+from difflib import SequenceMatcher
 from urllib.parse import urlparse
 from datetime import datetime
 
@@ -284,6 +285,27 @@ def _whois_fallback(domain: str) -> dict:
     return result
 
 
+BRANDS = [
+    "paypal", "microsoft", "google", "apple", "amazon", "netflix", "facebook",
+    "instagram", "twitter", "linkedin", "dropbox", "outlook", "onedrive",
+    "office365", "chase", "wellsfargo", "bankofamerica", "citibank",
+    "steam", "spotify", "adobe", "docusign", "dhl", "fedex", "ups",
+    "coinbase", "binance", "metamask", "robinhood", "venmo", "cashapp",
+]
+
+
+def _similar_brand(domain: str) -> dict | None:
+    name = domain.replace("www.", "").split(".")[0].lower()
+    best, best_score = None, 0.0
+    for brand in BRANDS:
+        score = SequenceMatcher(None, name, brand).ratio()
+        if score > best_score:
+            best, best_score = brand, score
+    if best_score >= 0.72 and best and best not in name:
+        return {"brand": best, "similarity_pct": round(best_score * 100)}
+    return None
+
+
 @mcp.tool()
 def analyze_domain(target_url: str) -> str:
     """extract domain age, registrar, and ssl certificate info"""
@@ -326,6 +348,18 @@ def analyze_domain(target_url: str) -> str:
             except Exception:
                 result["ssl_error"] = "likely self-signed or invalid cert"
                 continue
+
+        similar = _similar_brand(domain)
+        if similar:
+            result["brand_similarity"] = similar
+
+        try:
+            import requests
+            geo = requests.get(f"http://ip-api.com/json/{domain}?fields=country,regionName,city,isp,org,as", timeout=4).json()
+            if geo.get("status") != "fail":
+                result["hosting"] = {k: v for k, v in geo.items() if k != "status"}
+        except Exception:
+            pass
 
         return json.dumps(result, indent=2)
     except Exception as e:

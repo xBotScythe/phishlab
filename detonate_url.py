@@ -4,6 +4,7 @@ import sys
 from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
+from playwright_stealth import Stealth
 
 def detonate(target_url, output_dir="/cage_drop"):
     parsed = urlparse(target_url)
@@ -44,53 +45,57 @@ def detonate(target_url, output_dir="/cage_drop"):
             extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
         )
 
-        # patch automation fingerprints before any page load
-        context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => [
-                    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-                    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-                    { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' },
-                ]
-            });
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-            const getParameter = WebGLRenderingContext.prototype.getParameter;
-            WebGLRenderingContext.prototype.getParameter = function(parameter) {
-                if (parameter === 37445) return 'Intel Inc.';
-                if (parameter === 37446) return 'Intel Iris OpenGL Engine';
-                return getParameter.call(this, parameter);
-            };
-            window.chrome = { runtime: {} };
-            const originalQuery = window.navigator.permissions.query;
-            window.navigator.permissions.query = (parameters) =>
-                parameters.name === 'notifications'
-                    ? Promise.resolve({ state: Notification.permission })
-                    : originalQuery(parameters);
-        """)
         page = context.new_page()
+        Stealth(
+            navigator_languages_override=("en-US", "en"),
+            navigator_platform_override="Win32",
+            webgl_vendor_override="Intel Inc.",
+            webgl_renderer_override="Intel Iris OpenGL Engine",
+        ).apply_stealth_sync(page)
 
         try:
-            # load target
             page.goto(target_url, timeout=30000, wait_until="domcontentloaded")
-            
-            # wait for cf
             page.wait_for_timeout(3000)
 
-            # cf interstitial bypass
+            # cf phishing interstitial bypass
             try:
-                # soft locate proceed
-                proceed_btn = page.get_by_role("button", name="Ignore & Proceed")
-                if proceed_btn.count() > 0:
-                    print("Found Cloudflare Phishing Interstitial. Bypassing...")
-                    proceed_btn.first.click()
-                    # Wait for the actual payload to load after clicking proceed
+                selectors = [
+                    'a:has-text("Ignore & Proceed")',
+                    'a:has-text("Ignore")',
+                    'text=Ignore & Proceed',
+                    '[href*="proceed"]',
+                ]
+                clicked = False
+                for sel in selectors:
+                    el = page.locator(sel)
+                    if el.count() > 0:
+                        print("cloudflare phishing interstitial detected, bypassing...")
+                        el.first.click()
+                        clicked = True
+                        break
+
+                if not clicked:
+                    # js fallback — works even if selector matching fails
+                    clicked = page.evaluate("""() => {
+                        const links = Array.from(document.querySelectorAll('a'));
+                        const target = links.find(a => a.textContent.includes('Ignore'));
+                        if (target) { target.click(); return true; }
+                        return false;
+                    }""")
+                    if clicked:
+                        print("cloudflare interstitial bypassed via js")
+
+                if clicked:
                     page.wait_for_timeout(5000)
-            except Exception as e:
+            except Exception:
                 pass
 
-            # wait 5 extra seconds to allow any delayed JS redirects
-            page.wait_for_timeout(5000)
+            # wait for network to settle (turnstile, js redirects, lazy loaders)
+            # falls back to 12s hard wait if networkidle never fires
+            try:
+                page.wait_for_load_state("networkidle", timeout=12000)
+            except Exception:
+                page.wait_for_timeout(12000)
 
             # capture full page screenshot
             page.screenshot(path=f"{output_dir}/screenshot.png", full_page=True)

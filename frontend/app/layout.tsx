@@ -29,6 +29,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               <Link href="/" className="hover:text-[var(--text-bright)]">/ dashboard</Link>
               <Link href="/detonate" className="hover:text-[var(--text-bright)]">/ detonate</Link>
               <Link href="/campaigns" className="hover:text-[var(--text-bright)]">/ campaigns</Link>
+              <Link href="/analytics" className="hover:text-[var(--text-bright)]">/ analytics</Link>
             </nav>
           </div>
         </header>

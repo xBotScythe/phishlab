@@ -2,11 +2,29 @@
 
 import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
+import Link from "next/link";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import StatusBadge from "@/components/StatusBadge";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+
+const SEV_STYLES: Record<string, string> = {
+  critical: "bg-[#ff000022] text-[#ff4444] border-[#ff4444]",
+  high: "bg-[#ff444422] text-[var(--error)] border-[var(--error)]",
+  medium: "bg-[#ffaa0022] text-[#ffaa00] border-[#ffaa00]",
+  low: "bg-[#4488ff22] text-[#4488ff] border-[#4488ff]",
+  benign: "bg-[#44bb4422] text-[var(--success)] border-[var(--success)]",
+};
+
+function SeverityBadge({ severity }: { severity: string }) {
+  const cls = SEV_STYLES[severity] ?? "text-dim border-[var(--border)]";
+  return (
+    <span className={`text-[0.6rem] uppercase tracking-widest border px-1.5 py-0.5 shrink-0 ${cls}`}>
+      {severity}
+    </span>
+  );
+}
 
 type RunData = {
   id: string;
@@ -22,6 +40,10 @@ type RunData = {
   urlscan_score: number | null;
   urlscan_id: string | null;
   campaign_id: string | null;
+  chain_depth: number;
+  chain_parent_id: string | null;
+  severity: string | null;
+  threat_summary: string | null;
 };
 
 export default function RunDetails() {
@@ -31,6 +53,7 @@ export default function RunDetails() {
   const [streamingToken, setStreamingToken] = useState("");
   const [completeReport, setCompleteReport] = useState("");
   const [status, setStatus] = useState("loading");
+  const [redirectChain, setRedirectChain] = useState<{ url: string; status: number }[]>([]);
 
   useEffect(() => {
     let isMounted = true;
@@ -49,6 +72,11 @@ export default function RunDetails() {
         if (data.report) {
           setCompleteReport(data.report);
         }
+
+        fetch(`${API}/api/runs/${run_id}/redirects`)
+          .then((r) => r.json())
+          .then((d) => { if (d.chain?.length > 1) setRedirectChain(d.chain); })
+          .catch(() => {});
 
         // stream if still in progress
         if (data.status !== "complete" && data.status !== "failed") {
@@ -112,6 +140,21 @@ export default function RunDetails() {
     }
   };
 
+  const handleRerun = async () => {
+    if (!run?.url) return;
+    try {
+      const res = await fetch(`${API}/api/detonate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: run.url }),
+      });
+      const data = await res.json();
+      if (data.run_id) router.push(`/runs/${data.run_id}`);
+    } catch {
+      alert("failed to start re-run");
+    }
+  };
+
   if (!run) return <div className="text-dim p-8 uppercase text-xs tracking-widest">// loading run metadata...</div>;
 
   return (
@@ -137,9 +180,22 @@ export default function RunDetails() {
                 <a href={`${API}/api/runs/${run_id}/export?format=stix`} download className="btn-outline btn py-1 px-3 text-xs">export stix</a>
               </>
             )}
+            {run.url && (
+              <button onClick={handleRerun} className="btn-outline btn py-1 px-3 text-xs">re-run</button>
+            )}
             <button onClick={handleDelete} className="btn-outline btn py-1 px-3 text-xs !border-[var(--error)] text-[var(--error)] hover:bg-[var(--error)] hover:text-white">delete</button>
           </div>
         </div>
+
+        {/* severity + summary */}
+        {run.severity && (
+          <div className="flex items-start gap-3">
+            <SeverityBadge severity={run.severity} />
+            {run.threat_summary && (
+              <p className="text-xs text-dim">{run.threat_summary}</p>
+            )}
+          </div>
+        )}
 
         {/* threat intel row — always shown for complete runs */}
         {status === "complete" && (
@@ -170,9 +226,35 @@ export default function RunDetails() {
                 campaign: {run.campaign_id.slice(0, 20)}
               </span>
             )}
+            {run.chain_depth > 0 && (
+              <span className="text-[var(--purple-bright)]">
+                chain depth: {run.chain_depth}
+                {run.chain_parent_id && (
+                  <a href={`/runs/${run.chain_parent_id}`} className="ml-1 text-dim hover:text-[var(--purple-bright)]">← parent</a>
+                )}
+              </span>
+            )}
           </div>
         )}
       </div>
+
+      {/* redirect chain */}
+      {redirectChain.length > 0 && (
+        <div className="card space-y-3">
+          <h3 className="text-xs uppercase tracking-widest text-dim font-bold">redirect_chain</h3>
+          <div className="flex flex-col gap-1">
+            {redirectChain.map((hop, i) => (
+              <div key={i} className="flex items-start gap-3 text-xs">
+                <span className={`shrink-0 w-10 text-right font-bold ${hop.status >= 400 ? "text-[var(--error)]" : hop.status >= 300 ? "text-[#f59e0b]" : "text-[var(--success)]"}`}>
+                  {hop.status}
+                </span>
+                <span className="text-dim shrink-0">{i === 0 ? "→" : "↳"}</span>
+                <span className="text-[var(--purple-bright)] break-all">{hop.url}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
         {/* screenshot */}

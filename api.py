@@ -28,6 +28,8 @@ from feed_the_cage import start_feed
 from threat_intel import run_threat_intel, format_intel_section
 from clustering import compute_screenshot_hash, find_campaign
 from ioc_export import collect_iocs, export_csv, export_stix
+from chain_hunter import hunt_chain, extract_candidates
+from agent import agent_escalate, agent_filter_chain, agent_should_hunt
 from prisma import Prisma
 
 app = FastAPI(title="PhishLab API", version="1.0.0")
@@ -57,10 +59,145 @@ class FeedRequest(BaseModel):
 
 
 
-# --- generation worker ---
+
+async def _spawn_chain_run(url: str, parent_id: str, depth: int):
+    if not prisma.is_connected():
+        return
+    import datetime as dt
+    from urllib.parse import urlparse as _up
+    safe_domain = _up(url).netloc.replace(":", "_").replace("/", "_")
+    run_id = f"{dt.datetime.now().strftime('%Y%m%d%H%M%S%f')[:17]}_{safe_domain}"
+    folder = os.path.join(CAGEDROP, run_id)
+    os.makedirs(folder, exist_ok=True)
+    await prisma.analysisrun.create(data={
+        "id": run_id,
+        "url": url,
+        "status": "pending",
+        "folder": folder,
+        "chainDepth": depth,
+        "chainParentId": parent_id,
+    })
+    await _run_detonation(run_id, url)
+
+
+def _build_webhook_payload(webhook_url: str, run_id: str, url: str, run, escalation: dict) -> dict:
+    vt = getattr(run, "vtMalicious", None)
+    score = getattr(run, "urlscanScore", None)
+    campaign = getattr(run, "campaignId", None)
+    severity = escalation.get("severity", "unknown").upper()
+    summary = escalation.get("summary", "")
+
+    vt_str = f"{vt} malicious detections" if vt else "no detections"
+    score_str = f"{score:.0f}/100" if score is not None else "n/a"
+    sev_emoji = {"CRITICAL": "🚨", "HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🔵", "BENIGN": "🟢"}.get(severity, "⚪")
+
+    if "hooks.slack.com" in webhook_url:
+        return {
+            "text": f"{sev_emoji} {severity} — PhishLab run complete",
+            "blocks": [
+                {"type": "header", "text": {"type": "plain_text", "text": f"PhishLab: {sev_emoji} {severity}"}},
+                {"type": "section", "text": {"type": "mrkdwn", "text": summary}} if summary else None,
+                {"type": "section", "fields": [
+                    {"type": "mrkdwn", "text": f"*URL:*\n{url}"},
+                    {"type": "mrkdwn", "text": f"*VirusTotal:*\n{vt_str}"},
+                    {"type": "mrkdwn", "text": f"*URLScan score:*\n{score_str}"},
+                    {"type": "mrkdwn", "text": f"*Campaign:*\n{campaign or 'none'}"},
+                ]},
+                {"type": "context", "elements": [
+                    {"type": "mrkdwn", "text": f"run `{run_id}`"}
+                ]},
+            ],
+        }
+
+    if "discord.com/api/webhooks" in webhook_url:
+        sev_color = {"CRITICAL": 0xFF0000, "HIGH": 0xFF4444, "MEDIUM": 0xFFAA00, "LOW": 0x4488FF, "BENIGN": 0x44BB44}
+        color = sev_color.get(severity, 0x888888)
+        fields = [
+            {"name": "URL", "value": url, "inline": False},
+            {"name": "Severity", "value": f"{sev_emoji} {severity}", "inline": True},
+            {"name": "VirusTotal", "value": vt_str, "inline": True},
+            {"name": "URLScan", "value": score_str, "inline": True},
+            {"name": "Campaign", "value": campaign or "none", "inline": True},
+        ]
+        return {
+            "embeds": [{
+                "title": f"PhishLab: {sev_emoji} {severity}",
+                "description": summary or None,
+                "color": color,
+                "fields": fields,
+                "footer": {"text": f"run {run_id}"},
+            }]
+        }
+
+    return {
+        "run_id": run_id,
+        "url": url,
+        "status": "complete",
+        "severity": escalation.get("severity"),
+        "threat_summary": summary,
+        "vt_malicious": vt,
+        "urlscan_score": score,
+        "campaign_id": campaign,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
+
+async def _fire_webhook(run_id: str, url: str, run, escalation: dict):
+    webhook_url = os.environ.get("WEBHOOK_URL", "")
+    if not webhook_url:
+        return
+    payload = _build_webhook_payload(webhook_url, run_id, url, run, escalation)
+    # remove None blocks (Slack)
+    if "blocks" in payload:
+        payload["blocks"] = [b for b in payload["blocks"] if b is not None]
+    try:
+        await asyncio.to_thread(_requests.post, webhook_url, json=payload, timeout=5)
+        print(f"webhook fired for {run_id}")
+    except Exception as e:
+        print(f"webhook failed: {e}")
+
+
+async def _post_report_agents(run_id: str, url: str, report: str, completed):
+    """escalation, webhook, and chain hunting — runs after report is saved, outside the queue worker."""
+    if not prisma.is_connected():
+        return
+    try:
+        escalation = await agent_escalate(
+            report, url,
+            getattr(completed, "vtMalicious", None),
+            getattr(completed, "urlscanScore", None),
+        )
+        await prisma.analysisrun.update(where={'id': run_id}, data={
+            'severity': escalation['severity'],
+            'threatSummary': escalation['summary'],
+        })
+
+        min_severity = os.environ.get("WEBHOOK_MIN_SEVERITY", "high")
+        severity_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "benign": 0}
+        if severity_rank.get(escalation['severity'], 0) >= severity_rank.get(min_severity, 3):
+            fresh = await prisma.analysisrun.find_unique(where={'id': run_id})
+            asyncio.create_task(_fire_webhook(run_id, url, fresh, escalation))
+
+        depth = getattr(completed, "chainDepth", 0) or 0
+        if depth < 2:
+            should_hunt = await agent_should_hunt(report, url, escalation['severity'])
+            if should_hunt:
+                raw_candidates = await extract_candidates(getattr(completed, "folder", ""), url)
+                filtered = await agent_filter_chain(raw_candidates, report, url)
+                for chain_url in filtered:
+                    existing = await prisma.analysisrun.find_first(
+                        where={"url": chain_url, "status": {"in": ["complete", "detonating", "extracting", "queued", "generating"]}}
+                    )
+                    if not existing:
+                        asyncio.create_task(_spawn_chain_run(chain_url, run_id, depth + 1))
+    except Exception as e:
+        print(f"POST-REPORT: agents failed for {run_id}: {e}")
+
 
 async def _generate_report(run_id: str):
     """generate llm report for a single run. called by the queue worker."""
+    if not prisma.is_connected():
+        return
     run = await prisma.analysisrun.find_unique(where={'id': run_id})
     if not run or run.status not in ('queued', 'generating'):
         return
@@ -101,18 +238,20 @@ async def _generate_report(run_id: str):
         with open(os.path.join(run.folder, "report.md"), "w", encoding="utf-8") as f:
             f.write(report)
 
+        completed = await prisma.analysisrun.find_unique(where={'id': run_id})
+        if completed and completed.screenshotHash:
+            campaign_id = await find_campaign(prisma, run_id, completed.screenshotHash, completed.url or "")
+            if campaign_id:
+                await prisma.analysisrun.update(where={'id': run_id}, data={'campaignId': campaign_id})
+
         await prisma.analysisrun.update(where={'id': run_id}, data={
             'status': 'complete',
             'report': report
         })
         print(f"GENERATE: finished report for {run_id}")
 
-        # assign campaign after report is complete
-        completed = await prisma.analysisrun.find_unique(where={'id': run_id})
-        if completed and completed.screenshotHash:
-            campaign_id = await find_campaign(prisma, run_id, completed.screenshotHash, completed.url or "")
-            if campaign_id:
-                await prisma.analysisrun.update(where={'id': run_id}, data={'campaignId': campaign_id})
+        # agent work runs in background so the queue worker can move to the next run immediately
+        asyncio.create_task(_post_report_agents(run_id, run.url or "", report, completed))
     except Exception as e:
         await prisma.analysisrun.update(where={'id': run_id}, data={
             'status': 'failed',
@@ -132,7 +271,6 @@ async def _generation_worker():
         generation_queue.task_done()
 
 
-# --- lifecycle ---
 
 @app.on_event("startup")
 async def startup():
@@ -202,6 +340,8 @@ def _extraction_complete(folder: str) -> bool:
 
 async def _run_detonation(run_id: str, url: str):
     """run (or resume) the detonation pipeline. skips any stage whose artifacts already exist."""
+    if not prisma.is_connected():
+        return
     run = await prisma.analysisrun.find_unique(where={'id': run_id})
     if not run:
         return
@@ -215,11 +355,11 @@ async def _run_detonation(run_id: str, url: str):
             await prisma.analysisrun.update(where={'id': run_id}, data={'hasScreenshot': True})
         else:
             await prisma.analysisrun.update(where={'id': run_id}, data={'status': 'detonating'})
-            success = await run_container(url, run.folder)
+            success, container_error = await run_container(url, run.folder)
             if not success:
                 await prisma.analysisrun.update(where={'id': run_id}, data={
                     'status': 'failed',
-                    'error': "docker container exited with non-zero code"
+                    'error': container_error,
                 })
                 return
             await prisma.analysisrun.update(where={'id': run_id}, data={'hasScreenshot': True})
@@ -262,10 +402,11 @@ async def _run_detonation(run_id: str, url: str):
         await generation_queue.put(run_id)
 
     except Exception as e:
-        await prisma.analysisrun.update(where={'id': run_id}, data={
-            'status': 'failed',
-            'error': str(e)
-        })
+        if prisma.is_connected():
+            await prisma.analysisrun.update(where={'id': run_id}, data={
+                'status': 'failed',
+                'error': str(e)
+            })
 
 
 @app.get("/api/health")
@@ -297,7 +438,7 @@ async def detonate(req: DetonateRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail="only http/https urls are allowed")
 
     domain = (parsed.netloc or "unknown").replace(":", "_").replace("/", "_")
-    timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")[:17]
     run_id = f"{timestamp}_{domain}"
     mac_folder = os.path.join(CAGEDROP, run_id)
     os.makedirs(mac_folder, exist_ok=True)
@@ -313,17 +454,62 @@ async def detonate(req: DetonateRequest, background_tasks: BackgroundTasks):
     return {"run_id": run_id, "status": "pending"}
 
 
+def _load_iocs(folder: str) -> dict:
+    path = os.path.join(folder, "extracted_iocs.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _ioc_delta(iocs_a: dict, iocs_b: dict) -> dict:
+    delta: dict = {}
+    keys = set(iocs_a) | set(iocs_b)
+    for key in keys:
+        a_vals = set(iocs_a.get(key, []) if isinstance(iocs_a.get(key), list) else [iocs_a[key]] if key in iocs_a else [])
+        b_vals = set(iocs_b.get(key, []) if isinstance(iocs_b.get(key), list) else [iocs_b[key]] if key in iocs_b else [])
+        added = list(b_vals - a_vals)
+        removed = list(a_vals - b_vals)
+        if added or removed:
+            delta[key] = {"added": added, "removed": removed}
+    return delta
+
+
 @app.get("/api/runs/diff")
 async def diff_runs(a: str, b: str):
-    """compare two runs side by side"""
+    """compare two runs side by side with ioc delta"""
     run_a = await prisma.analysisrun.find_unique(where={'id': a})
     run_b = await prisma.analysisrun.find_unique(where={'id': b})
     if not run_a or not run_b:
         raise HTTPException(status_code=404, detail="one or both runs not found")
 
+    iocs_a = _load_iocs(run_a.folder)
+    iocs_b = _load_iocs(run_b.folder)
+    delta = _ioc_delta(iocs_a, iocs_b)
+
+    # surface final_url change explicitly
+    url_changed = iocs_a.get("final_url") != iocs_b.get("final_url") and iocs_b.get("final_url")
+
     return {
-        "a": {"id": run_a.id, "url": run_a.url, "status": run_a.status, "report": run_a.report, "has_screenshot": run_a.hasScreenshot},
-        "b": {"id": run_b.id, "url": run_b.url, "status": run_b.status, "report": run_b.report, "has_screenshot": run_b.hasScreenshot}
+        "a": {
+            "id": run_a.id, "url": run_a.url, "status": run_a.status,
+            "report": run_a.report, "has_screenshot": run_a.hasScreenshot,
+            "created_at": run_a.createdAt.strftime("%Y-%m-%dT%H:%M:%SZ") if run_a.createdAt else None,
+            "severity": run_a.severity, "threat_summary": run_a.threatSummary,
+            "vt_malicious": run_a.vtMalicious, "urlscan_score": run_a.urlscanScore,
+        },
+        "b": {
+            "id": run_b.id, "url": run_b.url, "status": run_b.status,
+            "report": run_b.report, "has_screenshot": run_b.hasScreenshot,
+            "created_at": run_b.createdAt.strftime("%Y-%m-%dT%H:%M:%SZ") if run_b.createdAt else None,
+            "severity": run_b.severity, "threat_summary": run_b.threatSummary,
+            "vt_malicious": run_b.vtMalicious, "urlscan_score": run_b.urlscanScore,
+        },
+        "delta": delta,
+        "url_changed": {"from": iocs_a.get("final_url"), "to": iocs_b.get("final_url")} if url_changed else None,
     }
 
 
@@ -371,11 +557,13 @@ async def stream_analysis(run_id: str):
 
 
 @app.get("/api/runs")
-async def list_runs(q: str = "", status: str = ""):
+async def list_runs(q: str = "", status: str = "", url: str = ""):
     db_runs = await prisma.analysisrun.find_many(order={'createdAt': 'desc'})
 
     results = []
     for run in db_runs:
+        if url and run.url != url:
+            continue
         if q and q.lower() not in (run.url or "").lower() and q.lower() not in run.id.lower():
             continue
         if status and run.status != status:
@@ -386,9 +574,12 @@ async def list_runs(q: str = "", status: str = ""):
             "status": run.status,
             "has_report": run.report is not None,
             "has_screenshot": run.hasScreenshot,
-            "created_at": run.createdAt.isoformat() if run.createdAt else None,
+            "created_at": run.createdAt.strftime("%Y-%m-%dT%H:%M:%SZ") if run.createdAt else None,
             "vt_malicious": run.vtMalicious,
             "campaign_id": run.campaignId,
+            "severity": run.severity,
+            "chain_depth": run.chainDepth or 0,
+            "chain_parent_id": run.chainParentId,
         })
     return {"runs": results}
 
@@ -405,7 +596,7 @@ async def get_run(run_id: str):
         "report": run.report,
         "status": run.status,
         "has_screenshot": run.hasScreenshot,
-        "created_at": run.createdAt.isoformat() if run.createdAt else None,
+        "created_at": run.createdAt.strftime("%Y-%m-%dT%H:%M:%SZ") if run.createdAt else None,
         "files": os.listdir(run.folder) if os.path.exists(run.folder) else [],
         "vt_malicious": run.vtMalicious,
         "vt_suspicious": run.vtSuspicious,
@@ -413,6 +604,10 @@ async def get_run(run_id: str):
         "urlscan_score": run.urlscanScore,
         "urlscan_id": run.urlscanId,
         "campaign_id": run.campaignId,
+        "chain_depth": run.chainDepth or 0,
+        "chain_parent_id": run.chainParentId,
+        "severity": run.severity,
+        "threat_summary": run.threatSummary,
     }
 
 
@@ -461,6 +656,90 @@ async def export_iocs(run_id: str, format: str = "csv"):
         )
 
 
+@app.get("/api/runs/{run_id}/redirects")
+async def get_redirects(run_id: str):
+    har_path = os.path.join(CAGEDROP, run_id, "network_traffic.har")
+    if not os.path.exists(har_path):
+        return {"chain": []}
+
+    with open(har_path) as f:
+        har = json.load(f)
+
+    entries = har.get("log", {}).get("entries", [])
+    url_map = {}
+    for entry in entries:
+        url = entry["request"]["url"]
+        if url not in url_map:
+            url_map[url] = entry
+
+    chain = []
+    current = entries[0] if entries else None
+    visited = set()
+
+    while current:
+        url = current["request"]["url"]
+        if url in visited:
+            break
+        visited.add(url)
+
+        status = current["response"]["status"]
+        redirect_to = current["response"].get("redirectURL", "")
+        chain.append({"url": url, "status": status})
+
+        if redirect_to and redirect_to in url_map:
+            current = url_map[redirect_to]
+        else:
+            break
+
+    return {"chain": chain}
+
+
+@app.get("/api/analytics")
+async def get_analytics():
+    from collections import Counter, defaultdict
+    all_runs = await prisma.analysisrun.find_many(order={"createdAt": "asc"})
+    complete = [r for r in all_runs if r.status == "complete"]
+
+    daily: dict = defaultdict(int)
+    for run in complete:
+        if run.createdAt:
+            day = run.createdAt.strftime("%Y-%m-%d")
+            daily[day] += 1
+
+    threat_dist: Counter = Counter()
+    for run in complete:
+        vt = run.vtMalicious
+        if vt is None:
+            threat_dist["unscored"] += 1
+        elif vt >= 5:
+            threat_dist["malicious"] += 1
+        elif vt > 0:
+            threat_dist["suspicious"] += 1
+        else:
+            threat_dist["clean"] += 1
+
+    status_counts: Counter = Counter(r.status for r in all_runs)
+
+    campaign_runs = [r for r in complete if r.campaignId]
+    campaign_counts: Counter = Counter(r.campaignId for r in campaign_runs)
+
+    return {
+        "totals": {
+            "total": len(all_runs),
+            "complete": len(complete),
+            "malicious": threat_dist.get("malicious", 0),
+            "campaigns": len(campaign_counts),
+        },
+        "runs_per_day": [{"date": k, "count": v} for k, v in sorted(daily.items())],
+        "threat_distribution": [{"name": k, "value": v} for k, v in threat_dist.items()],
+        "status_breakdown": [{"status": k, "count": v} for k, v in status_counts.items()],
+        "top_campaigns": [
+            {"id": cid[:12], "runs": count}
+            for cid, count in campaign_counts.most_common(8)
+        ],
+    }
+
+
 @app.get("/api/campaigns")
 async def list_campaigns():
     runs = await prisma.analysisrun.find_many(
@@ -475,15 +754,15 @@ async def list_campaigns():
                 "campaign_id": cid,
                 "run_count": 0,
                 "runs": [],
-                "first_seen": run.createdAt.isoformat() if run.createdAt else None,
-                "last_seen": run.createdAt.isoformat() if run.createdAt else None,
+                "first_seen": run.createdAt.strftime("%Y-%m-%dT%H:%M:%SZ") if run.createdAt else None,
+                "last_seen": run.createdAt.strftime("%Y-%m-%dT%H:%M:%SZ") if run.createdAt else None,
             }
         campaigns[cid]["run_count"] += 1
-        campaigns[cid]["last_seen"] = run.createdAt.isoformat() if run.createdAt else None
+        campaigns[cid]["last_seen"] = run.createdAt.strftime("%Y-%m-%dT%H:%M:%SZ") if run.createdAt else None
         campaigns[cid]["runs"].append({
             "id": run.id,
             "url": run.url,
-            "created_at": run.createdAt.isoformat() if run.createdAt else None,
+            "created_at": run.createdAt.strftime("%Y-%m-%dT%H:%M:%SZ") if run.createdAt else None,
         })
     return {"campaigns": list(campaigns.values())}
 
@@ -526,7 +805,7 @@ async def get_feed_status():
         return {"active": False, "last_run": None, "batch_size": 0}
     return {
         "active": status.active,
-        "last_run": status.lastRun.isoformat() if status.lastRun else None,
+        "last_run": status.lastRun.strftime("%Y-%m-%dT%H:%M:%SZ") if status.lastRun else None,
         "batch_size": status.batchSize
     }
 

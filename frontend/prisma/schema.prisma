@@ -28,6 +28,10 @@ model AnalysisRun {
   urlscanId      String?
   screenshotHash String?
   campaignId     String?
+  chainDepth     Int      @default(0)
+  chainParentId  String?
+  severity       String?
+  threatSummary  String?
 }
 
 model FeedStatus {

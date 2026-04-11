@@ -10,6 +10,7 @@ from detonation import run_container
 from ollama_manager import start_ollama
 from threat_intel import run_threat_intel, format_intel_section
 from clustering import compute_screenshot_hash
+from triage import triage_urls
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CAGEDROP = os.path.join(BASE_DIR, "CageDrop")
@@ -92,7 +93,7 @@ async def process_url(url, semaphore, on_ready=None):
     async with semaphore:
         parsed = urlparse(url)
         safe_domain = parsed.netloc.replace(":", "_").replace("/", "_")
-        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")[:17]
         run_id = f"{timestamp}_{safe_domain}"
         mac_folder = os.path.join(CAGEDROP, run_id)
         os.makedirs(mac_folder, exist_ok=True)
@@ -107,13 +108,13 @@ async def process_url(url, semaphore, on_ready=None):
                 "folder": mac_folder,
             })
 
-        success = await run_container(url, mac_folder)
+        success, container_error = await run_container(url, mac_folder)
         if not success:
-            print(f"  !! detonation failed: {url}")
+            print(f"  !! detonation failed: {url}: {container_error}")
             if prisma.is_connected():
                 await prisma.analysisrun.update(
                     where={"id": run_id},
-                    data={"status": "failed", "error": "detonation failed"},
+                    data={"status": "failed", "error": container_error},
                 )
             return
 
@@ -188,10 +189,12 @@ async def start_feed(limit: int = 5, on_ready=None):
     except Exception:
         pass
 
-    # check more than needed so dead sites don't eat into the limit
     candidates = urls[:limit * 5]
-    print(f"checking reachability for {len(candidates)} candidates...")
-    live = await filter_live(candidates)
+    print(f"triaging {len(candidates)} candidates...")
+    triaged = await triage_urls(candidates)
+
+    print(f"checking reachability for triaged candidates...")
+    live = await filter_live([u for u, _ in triaged])
     subset = live[:limit]
     print(f"{len(subset)} live urls to detonate")
 
