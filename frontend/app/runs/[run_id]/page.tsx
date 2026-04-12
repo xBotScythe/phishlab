@@ -44,6 +44,15 @@ type RunData = {
   chain_parent_id: string | null;
   severity: string | null;
   threat_summary: string | null;
+  agent_verdict: {
+    severity: string;
+    confidence: string;
+    summary: string;
+    delivery_vector: string;
+    user_interaction: string;
+    kit_fingerprint: string;
+    reasoning: string;
+  } | null;
 };
 
 export default function RunDetails() {
@@ -187,15 +196,39 @@ export default function RunDetails() {
           </div>
         </div>
 
-        {/* severity + summary */}
-        {run.severity && (
+        {/* agent verdict */}
+        {run.agent_verdict ? (
+          <div className="space-y-3">
+            <div className="flex items-start gap-3">
+              <SeverityBadge severity={run.agent_verdict.severity} />
+              <span className="text-[0.6rem] uppercase tracking-widest text-dim border border-[var(--border)] px-1.5 py-0.5">
+                {run.agent_verdict.confidence} confidence
+              </span>
+              <p className="text-xs text-dim">{run.agent_verdict.summary}</p>
+            </div>
+            <div className="flex gap-6 flex-wrap text-[0.6rem] uppercase tracking-widest text-dim">
+              {run.agent_verdict.delivery_vector && run.agent_verdict.delivery_vector !== "unknown" && (
+                <span>vector: <span className="text-[var(--fg)]">{run.agent_verdict.delivery_vector}</span></span>
+              )}
+              {run.agent_verdict.user_interaction && run.agent_verdict.user_interaction !== "unknown" && (
+                <span>interaction: <span className="text-[var(--fg)]">{run.agent_verdict.user_interaction}</span></span>
+              )}
+              {run.agent_verdict.kit_fingerprint && (
+                <span>kit: <span className="text-[var(--purple-bright)]">{run.agent_verdict.kit_fingerprint}</span></span>
+              )}
+            </div>
+            {run.agent_verdict.reasoning && (
+              <p className="text-[0.65rem] text-dim leading-relaxed">{run.agent_verdict.reasoning}</p>
+            )}
+          </div>
+        ) : run.severity ? (
           <div className="flex items-start gap-3">
             <SeverityBadge severity={run.severity} />
             {run.threat_summary && (
               <p className="text-xs text-dim">{run.threat_summary}</p>
             )}
           </div>
-        )}
+        ) : null}
 
         {/* threat intel row — always shown for complete runs */}
         {status === "complete" && (

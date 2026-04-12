@@ -11,7 +11,7 @@ URL submitted
 [Docker Container] -- playwright captures screenshot, HAR, DOM, JS runtime
     |
     v
-[MCP Server] -- HAR, DOM IoCs, WHOIS/SSL, IP geolocation, brand similarity, JS runtime
+[MCP Extraction Server] -- HAR, DOM IoCs, WHOIS/SSL, IP geo, brand similarity, JS runtime
     |
     v
 [Threat Intel] -- VirusTotal + URLScan enrichment (optional)
@@ -20,16 +20,14 @@ URL submitted
 [Local LLM] -- vision-capable model analyzes screenshot + structured data
     |
     v
-[Agent: Escalation] -- assigns severity (critical/high/medium/low/benign) + one-line summary
+[Orchestrator] -- MCP client connecting to all agent servers
     |
-    v
-[Webhook] -- fires on completion if severity meets threshold (optional)
+    +--[MCP: Memory Server]------> cross-sample correlation (prior verdicts, kit fingerprints)
     |
-    v
-[Agent: Chain Hunt Decision] -- decides if site warrants following its infrastructure
+    +--[MCP: Escalation Server]--> structured verdict (severity, delivery vector, kit fingerprint,
+    |                               user interaction, reasoning) via schema-enforced LLM output
     |
-    v
-[Agent: Chain Filter] -- approves specific secondary URLs worth detonating
+    +--[MCP: Hunt Server]--------> chain hunt decision + candidate filtering
     |
     v
 [Chain Hunter] -- queues approved URLs as child runs (max depth 2, max 3 per run)
@@ -38,6 +36,9 @@ URL submitted
 **key design decisions:**
 - detonation happens inside disposable Docker containers — nothing touches the host
 - analysis uses MCP (model context protocol) for structured tool invocation
+- agent decisions use real MCP servers connected via stdio — not prompt chains
+- all agent output is schema-enforced via ollama's `format=json_schema` — no regex parsing
+- cross-sample memory correlates kit fingerprints and domains across runs
 - LLM runs locally via Ollama — no data leaves your machine
 - reports stream token-by-token via SSE to the frontend
 - browser fingerprint is spoofed (UA, plugins, WebGL, webdriver flag) to reduce WAF blocks
@@ -77,22 +78,42 @@ navigate to `/detonate`, paste a suspicious URL, and submit. the system will:
 3. extract IoCs via MCP tools (HAR, DOM, WHOIS/SSL, IP geolocation, JS runtime, brand similarity)
 4. enrich with VirusTotal + URLScan if keys are configured
 5. stream a threat report from the local LLM (screenshot passed to vision model)
-6. assign a severity level and one-line threat summary via LLM escalation
-7. fire a webhook notification if severity meets the configured threshold
-8. agent decides whether to hunt secondary infrastructure — if yes, queues child runs automatically
+6. orchestrator queries cross-sample memory, then runs escalation for a structured verdict (severity, delivery vector, kit fingerprint, user interaction, reasoning)
+7. verdict stored in memory for future correlation
+8. fire a webhook notification if severity meets the configured threshold
+9. hunt server decides whether to follow secondary infrastructure — if yes, filter server approves specific URLs and child runs are queued
 
-### severity & escalation
-after each report, a local LLM agent assigns a severity level and writes a one-line threat summary:
+### multi-agent verdict system
+after each report, an orchestrator coordinates three MCP agent servers to produce a structured verdict:
 
-| severity | meaning |
-|----------|---------|
-| `critical` | active credential harvesting, confirmed malicious kit, live exfil |
-| `high` | strong phishing indicators, brand impersonation, suspicious behavior |
-| `medium` | some indicators, unclear intent |
-| `low` | minimal indicators, likely benign |
-| `benign` | personal site, portfolio, false positive |
+1. **memory server** — queries prior observations for cross-sample context (same domain, same kit fingerprint, recent activity)
+2. **escalation server** — produces a full `ThreatVerdict` with severity, confidence, delivery vector, user interaction model, kit fingerprint, and analytical reasoning
+3. **memory server** — stores the new verdict for future correlation
+
+all agent output is schema-enforced — ollama's `format=json_schema` parameter guarantees valid structured JSON matching the pydantic model. no regex parsing needed.
+
+the verdict includes:
+- **severity** — `critical`, `high`, `medium`, `low`, or `benign`
+- **confidence** — `high`, `medium`, or `low` (based on corroborating signals)
+- **delivery vector** — how the victim likely arrived (email link, SMS, ad redirect, search poisoning, etc.)
+- **user interaction** — what the kit wants the victim to do (credential entry, file download, oauth grant, etc.)
+- **kit fingerprint** — recognizable markers (js globals, form field names, exfil endpoints, css naming conventions)
+- **reasoning** — 2-3 sentence chain of thought explaining the assessment
+
+for chain children, the parent's verdict is passed as context so the LLM understands where in the attack chain this URL sits.
 
 severity badges appear in the run list, run detail page, and diff comparisons. chain hunting is skipped entirely for `low` and `benign` runs.
+
+### cross-sample memory
+the memory server maintains a persistent store of all verdict observations. when a new URL is analyzed, the orchestrator queries memory for:
+- exact domain matches (score: 3)
+- same root domain (score: 2)
+- same kit fingerprint (score: 2)
+- recent activity within 24h (score: 1)
+
+the top 7 matches are formatted as context for the escalation LLM. if 2+ entries share a kit fingerprint, a pattern note is included (e.g. "kit 'evilproxy' seen across 4 samples").
+
+memory auto-compacts when it exceeds 200 entries: benign entries expire after 7 days, low after 30 days, duplicates are deduped (newest kept), and critical/high entries persist indefinitely.
 
 ### chain hunting
 after each completed analysis, an LLM agent first decides whether the site's infrastructure is worth following (it skips benign/low-severity sites and CMS pages with no suspicious secondary URLs). if approved, a second agent reviews the candidates extracted from the run's artifacts (form action targets, embedded iframes, HAR redirect hops) and approves only the ones worth detonating.
@@ -210,25 +231,30 @@ payload includes severity and the LLM's one-line threat summary:
 
 ```
 phishlab/
-├── api.py              # fastapi rest api + sse streaming
-├── agent.py            # LLM agents: escalation, chain hunt decision, chain candidate filter
-├── analyzer.py         # mcp client, builds prompt from extracted data
-├── mcp_server.py       # mcp tools: HAR, DOM, WHOIS/SSL, IP geo, JS runtime, brand similarity
-├── detonation.py       # shared docker container runner
-├── detonate_url.py     # runs inside the container (playwright + stealth)
-├── threat_intel.py     # virustotal + urlscan enrichment
-├── clustering.py       # perceptual hash campaign grouping
-├── chain_hunter.py     # secondary url extraction and filtering (static assets, CDNs excluded)
-├── triage.py           # feed candidate scoring by ASN and domain age
-├── ioc_export.py       # csv + stix 2.1 export
-├── feed_the_cage.py    # automated phishstats feed ingestion
-├── ollama_manager.py   # ollama process lifecycle
-├── launcher.py         # unified startup (deps, docker build, db, api, frontend)
-├── Dockerfile          # detonation container image
-├── docker-compose.yml  # postgres database
-├── frontend/           # next.js dashboard
-│   ├── app/            # pages (dashboard, detonate, run detail, diff, campaigns, analytics, history)
-│   ├── components/     # shared ui (RunsList, FeedControl, StatusBadge, HealthIndicator)
-│   └── prisma/         # database schema
-└── requirements.txt    # python dependencies
+├── api.py                      # fastapi rest api + sse streaming
+├── orchestrator.py             # mcp client connecting to all agent servers (singleton)
+├── agent_escalation_server.py  # mcp server: structured threat verdicts via schema-enforced llm
+├── agent_hunt_server.py        # mcp server: chain hunt decisions + candidate filtering
+├── agent_memory_server.py      # mcp server: cross-sample memory with auto-compaction
+├── schemas.py                  # shared pydantic models for all agent communication
+├── analyzer.py                 # mcp client, builds prompt from extracted data
+├── mcp_server.py               # mcp tools: HAR, DOM, WHOIS/SSL, IP geo, JS runtime, brand similarity
+├── detonation.py               # shared docker container runner
+├── detonate_url.py             # runs inside the container (playwright + stealth)
+├── threat_intel.py             # virustotal + urlscan enrichment
+├── clustering.py               # perceptual hash campaign grouping
+├── chain_hunter.py             # secondary url extraction and filtering
+├── triage.py                   # feed candidate scoring by ASN and domain age
+├── ioc_export.py               # csv + stix 2.1 export
+├── feed_the_cage.py            # automated phishstats feed ingestion
+├── ollama_manager.py           # ollama process lifecycle
+├── launcher.py                 # unified startup (deps, docker build, db, api, frontend)
+├── Dockerfile                  # detonation container image
+├── docker-compose.yml          # postgres database
+├── agent_memory.json           # persistent verdict memory (managed by memory server)
+├── frontend/                   # next.js dashboard
+│   ├── app/                    # pages (dashboard, detonate, run detail, diff, campaigns, analytics, history)
+│   ├── components/             # shared ui (RunsList, FeedControl, StatusBadge, HealthIndicator)
+│   └── prisma/                 # database schema
+└── requirements.txt            # python dependencies
 ```

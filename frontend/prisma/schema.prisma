@@ -32,6 +32,7 @@ model AnalysisRun {
   chainParentId  String?
   severity       String?
   threatSummary  String?
+  agentVerdict   String?  @db.Text
 }
 
 model FeedStatus {

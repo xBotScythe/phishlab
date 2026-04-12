@@ -29,11 +29,12 @@ from threat_intel import run_threat_intel, format_intel_section
 from clustering import compute_screenshot_hash, find_campaign
 from ioc_export import collect_iocs, export_csv, export_stix
 from chain_hunter import hunt_chain, extract_candidates
-from agent import agent_escalate, agent_filter_chain, agent_should_hunt
+from orchestrator import AgentOrchestrator
 from prisma import Prisma
 
 app = FastAPI(title="PhishLab API", version="1.0.0")
 prisma = Prisma()
+orchestrator = AgentOrchestrator()
 
 # generation queue -- runs go in when extraction finishes, worker processes one at a time
 generation_queue: asyncio.Queue = asyncio.Queue()
@@ -158,32 +159,55 @@ async def _fire_webhook(run_id: str, url: str, run, escalation: dict):
 
 
 async def _post_report_agents(run_id: str, url: str, report: str, completed):
-    """escalation, webhook, and chain hunting — runs after report is saved, outside the queue worker."""
+    """escalation, webhook, and chain hunting via mcp orchestrator."""
     if not prisma.is_connected():
         return
     try:
-        escalation = await agent_escalate(
-            report, url,
-            getattr(completed, "vtMalicious", None),
-            getattr(completed, "urlscanScore", None),
+        # load parent verdict for chain children
+        parent_verdict = ""
+        parent_id = getattr(completed, "chainParentId", None)
+        if parent_id:
+            parent = await prisma.analysisrun.find_unique(where={'id': parent_id})
+            if parent and parent.agentVerdict:
+                try:
+                    pv = json.loads(parent.agentVerdict)
+                    parent_verdict = f"{pv.get('severity', 'unknown')} — {pv.get('summary', '')}"
+                except Exception:
+                    pass
+
+        verdict = await orchestrator.run_verdict(
+            url=url,
+            report=report,
+            vt_malicious=getattr(completed, "vtMalicious", None),
+            urlscan_score=getattr(completed, "urlscanScore", None),
+            parent_verdict=parent_verdict,
         )
+
         await prisma.analysisrun.update(where={'id': run_id}, data={
-            'severity': escalation['severity'],
-            'threatSummary': escalation['summary'],
+            'severity': verdict.get('severity', 'medium'),
+            'threatSummary': verdict.get('summary', ''),
+            'agentVerdict': json.dumps(verdict),
         })
 
+        # webhook if severity meets threshold
         min_severity = os.environ.get("WEBHOOK_MIN_SEVERITY", "high")
         severity_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "benign": 0}
-        if severity_rank.get(escalation['severity'], 0) >= severity_rank.get(min_severity, 3):
+        if severity_rank.get(verdict.get('severity', 'medium'), 0) >= severity_rank.get(min_severity, 3):
             fresh = await prisma.analysisrun.find_unique(where={'id': run_id})
-            asyncio.create_task(_fire_webhook(run_id, url, fresh, escalation))
+            asyncio.create_task(_fire_webhook(run_id, url, fresh, verdict))
 
+        # chain hunting
         depth = getattr(completed, "chainDepth", 0) or 0
         if depth < 2:
-            should_hunt = await agent_should_hunt(report, url, escalation['severity'])
+            should_hunt = await orchestrator.run_hunt(
+                report=report,
+                url=url,
+                severity=verdict.get('severity', 'medium'),
+                confidence=verdict.get('confidence', 'low'),
+            )
             if should_hunt:
                 raw_candidates = await extract_candidates(getattr(completed, "folder", ""), url)
-                filtered = await agent_filter_chain(raw_candidates, report, url)
+                filtered = await orchestrator.run_chain_filter(raw_candidates, report, url)
                 for chain_url in filtered:
                     existing = await prisma.analysisrun.find_first(
                         where={"url": chain_url, "status": {"in": ["complete", "detonating", "extracting", "queued", "generating"]}}
@@ -292,6 +316,11 @@ async def startup():
     start_ollama()
     os.makedirs(CAGEDROP, exist_ok=True)
 
+    try:
+        await orchestrator.start()
+    except Exception as e:
+        print(f"WARNING: orchestrator failed to start ({e}), agent features disabled")
+
     asyncio.create_task(_generation_worker())
 
     # re-queue runs that were mid-generation when the server went down
@@ -321,6 +350,7 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
+    await orchestrator.stop()
     await prisma.disconnect()
     stop_ollama()
 
@@ -608,6 +638,7 @@ async def get_run(run_id: str):
         "chain_parent_id": run.chainParentId,
         "severity": run.severity,
         "threat_summary": run.threatSummary,
+        "agent_verdict": json.loads(run.agentVerdict) if run.agentVerdict else None,
     }
 
 
