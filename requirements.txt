@@ -26,3 +26,4 @@ python-dotenv
 # campaign clustering (screenshot perceptual hashing)
 imagehash
 Pillow
+yara-python

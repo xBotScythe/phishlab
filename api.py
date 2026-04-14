@@ -25,25 +25,27 @@ from analyzer import run_analysis, MODEL
 from detonation import run_container
 from ollama_manager import start_ollama, stop_ollama
 from feed_the_cage import start_feed
-from threat_intel import run_threat_intel, format_intel_section
+from threat_intel import run_threat_intel, format_intel_section, vt_scan_file
 from clustering import compute_screenshot_hash, find_campaign
 from ioc_export import collect_iocs, export_csv, export_stix
 from chain_hunter import hunt_chain, extract_candidates
+from yara_scanner import scan_folder as yara_scan, format_for_prompt as yara_format
+from attack_mapping import map_techniques, enrich_stix_bundle
 from orchestrator import AgentOrchestrator
 from prisma import Prisma
 
-app = FastAPI(title="PhishLab API", version="1.0.0")
+app = FastAPI(title="PhishLab API", version="2.0.0")
 prisma = Prisma()
 orchestrator = AgentOrchestrator()
 
 # generation queue -- runs go in when extraction finishes, worker processes one at a time
 generation_queue: asyncio.Queue = asyncio.Queue()
 
+_frontend_port = os.environ.get("FRONTEND_PORT", "3000")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3000", "http://localhost:3001",
-        "http://127.0.0.1:3000", "http://127.0.0.1:3001"
+        f"http://localhost:{_frontend_port}", f"http://127.0.0.1:{_frontend_port}",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -175,13 +177,49 @@ async def _post_report_agents(run_id: str, url: str, report: str, completed):
                 except Exception:
                     pass
 
+        folder = getattr(completed, "folder", "")
+
+        yara_context = ""
+        yara_path = os.path.join(folder, "yara_matches.json")
+        if os.path.exists(yara_path):
+            try:
+                with open(yara_path) as yf:
+                    yara_context = yara_format(json.load(yf))
+            except Exception:
+                pass
+
+        file_scans = _load_json(folder, "file_scan_results.json") or []
+        has_malicious_download = any(s.get("malicious", 0) > 0 for s in file_scans)
+
         verdict = await orchestrator.run_verdict(
             url=url,
             report=report,
             vt_malicious=getattr(completed, "vtMalicious", None),
             urlscan_score=getattr(completed, "urlscanScore", None),
             parent_verdict=parent_verdict,
+            yara_context=yara_context,
+            has_malicious_download=has_malicious_download,
         )
+
+        # ATT&CK mapping from verdict + yara + form data
+        yara_matches = []
+        if os.path.exists(yara_path):
+            try:
+                with open(yara_path) as yf:
+                    yara_matches = json.load(yf)
+            except Exception:
+                pass
+        form_data = None
+        form_path = os.path.join(getattr(completed, "folder", ""), "form_submission.json")
+        if os.path.exists(form_path):
+            try:
+                with open(form_path) as ff:
+                    form_data = json.load(ff)
+            except Exception:
+                pass
+
+        techniques = map_techniques(verdict, yara_matches, form_data)
+        verdict["attack_techniques"] = techniques
 
         await prisma.analysisrun.update(where={'id': run_id}, data={
             'severity': verdict.get('severity', 'medium'),
@@ -263,8 +301,14 @@ async def _generate_report(run_id: str):
             f.write(report)
 
         completed = await prisma.analysisrun.find_unique(where={'id': run_id})
-        if completed and completed.screenshotHash:
-            campaign_id = await find_campaign(prisma, run_id, completed.screenshotHash, completed.url or "")
+        if completed:
+            campaign_id = await find_campaign(
+                prisma, run_id,
+                completed.screenshotHash or "",
+                completed.url or "",
+                completed.folder,
+                completed.agentVerdict,
+            )
             if campaign_id:
                 await prisma.analysisrun.update(where={'id': run_id}, data={'campaignId': campaign_id})
 
@@ -322,6 +366,7 @@ async def startup():
         print(f"WARNING: orchestrator failed to start ({e}), agent features disabled")
 
     asyncio.create_task(_generation_worker())
+    asyncio.create_task(_watchlist_worker())
 
     # re-queue runs that were mid-generation when the server went down
     try:
@@ -409,8 +454,24 @@ async def _run_detonation(run_id: str, url: str):
                 run_threat_intel(url),
             )
             prompt += format_intel_section(intel)
+
+            # yara scan against phishing kit rules
+            yara_matches = await asyncio.to_thread(yara_scan, run.folder)
+            yara_section = yara_format(yara_matches)
+            if yara_section:
+                prompt += f"\n\n{yara_section}"
+            # save matches for escalation context
+            if yara_matches:
+                try:
+                    with open(os.path.join(run.folder, "yara_matches.json"), "w") as yf:
+                        json.dump(yara_matches, yf, indent=2)
+                except Exception:
+                    pass
+
             vt = intel.get("virustotal")
             us = intel.get("urlscan")
+            urlhaus = intel.get("urlhaus")
+            domain_age = intel.get("domain_age")
             intel_update = {}
             if vt:
                 intel_update.update({
@@ -420,8 +481,36 @@ async def _run_detonation(run_id: str, url: str):
                 })
             if us:
                 intel_update.update({'urlscanScore': float(us['score']), 'urlscanId': us['uuid']})
+            if urlhaus:
+                intel_update['urlhausHit'] = True
+            if domain_age:
+                intel_update['domainAgeDays'] = domain_age['days_old']
             if intel_update:
                 await prisma.analysisrun.update(where={'id': run_id}, data=intel_update)
+
+            # vt file scans for any downloads captured during detonation
+            downloads_meta = _load_json(run.folder, "downloads.json")
+            if downloads_meta:
+                file_results = []
+                for dl in downloads_meta:
+                    path = dl.get("path", "")
+                    if path and os.path.exists(path):
+                        result = await asyncio.to_thread(vt_scan_file, path)
+                        if result:
+                            file_results.append(result)
+                            print(f"VT FILE: {result['filename']} — {result['malicious']} malicious")
+                if file_results:
+                    malicious_files = [r for r in file_results if r["malicious"] > 0]
+                    prompt += f"\n\nDownloaded Files (VirusTotal):\n"
+                    for r in file_results:
+                        total = r["malicious"] + r["suspicious"] + r["harmless"] + r["undetected"]
+                        prompt += f"- {r['filename']}: {r['malicious']} malicious, {r['suspicious']} suspicious / {total} engines\n"
+                    try:
+                        with open(os.path.join(run.folder, "file_scan_results.json"), "w") as fsf:
+                            json.dump(file_results, fsf, indent=2)
+                    except Exception:
+                        pass
+
             try:
                 with open(os.path.join(run.folder, "prompt.txt"), "w", encoding="utf-8") as pf:
                     pf.write(prompt)
@@ -482,6 +571,17 @@ async def detonate(req: DetonateRequest, background_tasks: BackgroundTasks):
 
     background_tasks.add_task(_run_detonation, run_id, req.url)
     return {"run_id": run_id, "status": "pending"}
+
+
+def _load_json(folder: str, filename: str) -> dict | None:
+    path = os.path.join(folder, filename)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 def _load_iocs(folder: str) -> dict:
@@ -639,6 +739,11 @@ async def get_run(run_id: str):
         "severity": run.severity,
         "threat_summary": run.threatSummary,
         "agent_verdict": json.loads(run.agentVerdict) if run.agentVerdict else None,
+        "urlhaus_hit": run.urlhausHit,
+        "domain_age_days": run.domainAgeDays,
+        "form_submission": _load_json(run.folder, "form_submission.json"),
+        "file_scans": _load_json(run.folder, "file_scan_results.json"),
+        "downloads": _load_json(run.folder, "downloads.json"),
     }
 
 
@@ -673,6 +778,16 @@ async def export_iocs(run_id: str, format: str = "csv"):
 
     if format == "stix":
         content = export_stix(iocs, run_id, run.url or "")
+        # enrich with ATT&CK techniques if verdict exists
+        if run.agentVerdict:
+            try:
+                verdict = json.loads(run.agentVerdict)
+                techniques = verdict.get("attack_techniques", [])
+                if techniques:
+                    bundle = json.loads(content)
+                    content = json.dumps(enrich_stix_bundle(bundle, techniques, run.url or ""), indent=2)
+            except Exception:
+                pass
         return StreamingResponse(
             iter([content]),
             media_type="application/json",
@@ -723,6 +838,60 @@ async def get_redirects(run_id: str):
             break
 
     return {"chain": chain}
+
+
+@app.get("/api/runs/{run_id}/takedown")
+async def get_takedown(run_id: str):
+    run = await prisma.analysisrun.find_unique(where={'id': run_id})
+    if not run:
+        raise HTTPException(status_code=404, detail="run not found")
+    if not run.url:
+        raise HTTPException(status_code=400, detail="run has no url")
+
+    from takedown import _rdap_registrar, _server_ips_from_har, _ip_info, _is_cloudflare, _vt_url_id
+    from datetime import datetime, timezone
+
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    vt_url = f"https://www.virustotal.com/gui/url/{_vt_url_id(run.url)}"
+
+    registrar_data, server_ips = await asyncio.gather(
+        asyncio.to_thread(_rdap_registrar, run.url),
+        asyncio.to_thread(_server_ips_from_har, run.folder),
+    )
+
+    hosting_info: dict = {}
+    cloudflare_detected = False
+    for ip in server_ips:
+        info = await asyncio.to_thread(_ip_info, ip)
+        org = info.get("org", "")
+        if org:
+            hosting_info = {
+                "ip": ip,
+                "org": org,
+                "asn": org.split(" ")[0],
+                "country": info.get("country", ""),
+                "is_cloudflare": _is_cloudflare(org),
+            }
+            cloudflare_detected = _is_cloudflare(org)
+            break
+
+    templates = await orchestrator.run_takedown(
+        url=run.url,
+        report=run.report or "",
+        registrar=registrar_data,
+        hosting=hosting_info,
+        cloudflare_detected=cloudflare_detected,
+        vt_malicious=run.vtMalicious,
+        vt_url=vt_url,
+        date_str=date_str,
+    )
+
+    return {
+        "registrar": registrar_data,
+        "hosting": hosting_info,
+        "cloudflare_detected": cloudflare_detected,
+        "templates": templates,
+    }
 
 
 @app.get("/api/analytics")
@@ -839,4 +1008,97 @@ async def get_feed_status():
         "last_run": status.lastRun.strftime("%Y-%m-%dT%H:%M:%SZ") if status.lastRun else None,
         "batch_size": status.batchSize
     }
+
+
+class WatchlistRequest(BaseModel):
+    url: str
+    interval_hours: int = 24
+    label: str = ""
+
+
+@app.get("/api/watchlist")
+async def list_watchlist():
+    entries = await prisma.watchlist.find_many(order={"createdAt": "desc"})
+    return {"entries": [
+        {
+            "id": e.id,
+            "url": e.url,
+            "interval_hours": e.intervalHours,
+            "last_run": e.lastRun.strftime("%Y-%m-%dT%H:%M:%SZ") if e.lastRun else None,
+            "created_at": e.createdAt.strftime("%Y-%m-%dT%H:%M:%SZ") if e.createdAt else None,
+            "active": e.active,
+            "label": e.label,
+        }
+        for e in entries
+    ]}
+
+
+@app.post("/api/watchlist")
+async def add_watchlist(req: WatchlistRequest):
+    existing = await prisma.watchlist.find_unique(where={"url": req.url})
+    if existing:
+        raise HTTPException(status_code=409, detail="url already in watchlist")
+    entry = await prisma.watchlist.create(data={
+        "url": req.url,
+        "intervalHours": req.interval_hours,
+        "label": req.label or None,
+    })
+    return {"id": entry.id, "message": "added to watchlist"}
+
+
+@app.delete("/api/watchlist/{entry_id}")
+async def remove_watchlist(entry_id: str):
+    await prisma.watchlist.delete(where={"id": entry_id})
+    return {"message": "removed from watchlist"}
+
+
+@app.patch("/api/watchlist/{entry_id}")
+async def update_watchlist(entry_id: str, req: WatchlistRequest):
+    await prisma.watchlist.update(
+        where={"id": entry_id},
+        data={"intervalHours": req.interval_hours, "label": req.label or None},
+    )
+    return {"message": "updated"}
+
+
+async def _watchlist_worker():
+    """check for due watchlist rescans every 5 minutes. only runs while server is active."""
+    while True:
+        await asyncio.sleep(300)
+        if not prisma.is_connected():
+            continue
+        try:
+            now = datetime.datetime.now(datetime.timezone.utc)
+            entries = await prisma.watchlist.find_many(where={"active": True})
+            for entry in entries:
+                if entry.lastRun is None:
+                    due = True
+                else:
+                    elapsed_hours = (now - entry.lastRun.replace(tzinfo=datetime.timezone.utc)).total_seconds() / 3600
+                    due = elapsed_hours >= entry.intervalHours
+                if not due:
+                    continue
+                # check nothing is already running for this url
+                in_flight = await prisma.analysisrun.find_first(where={
+                    "url": entry.url,
+                    "status": {"in": ["pending", "detonating", "extracting", "queued", "generating"]},
+                })
+                if in_flight:
+                    continue
+                print(f"WATCHLIST: rescanning {entry.url}")
+                parsed = urlparse(entry.url)
+                domain = (parsed.netloc or "unknown").replace(":", "_").replace("/", "_")
+                run_id = f"{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')[:17]}_{domain}"
+                folder = os.path.join(CAGEDROP, run_id)
+                os.makedirs(folder, exist_ok=True)
+                await prisma.analysisrun.create(data={
+                    "id": run_id, "url": entry.url, "status": "pending", "folder": folder,
+                })
+                await prisma.watchlist.update(
+                    where={"id": entry.id},
+                    data={"lastRun": now},
+                )
+                asyncio.create_task(_run_detonation(run_id, entry.url))
+        except Exception as e:
+            print(f"WATCHLIST: worker error: {e}")
 

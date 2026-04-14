@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import ReactMarkdown from "react-markdown";
@@ -44,6 +44,8 @@ type RunData = {
   chain_parent_id: string | null;
   severity: string | null;
   threat_summary: string | null;
+  urlhaus_hit: boolean | null;
+  domain_age_days: number | null;
   agent_verdict: {
     severity: string;
     confidence: string;
@@ -52,7 +54,25 @@ type RunData = {
     user_interaction: string;
     kit_fingerprint: string;
     reasoning: string;
+    attack_techniques?: { id: string; name: string; source: string }[];
   } | null;
+  form_submission: {
+    form_action: string;
+    form_method: string;
+    fields_filled: Record<string, string>;
+    input_count: number;
+    submission: { url: string; method: string; post_data: string | null } | null;
+    post_submit_url: string;
+  } | null;
+  file_scans: { filename: string; vt_malicious: number; vt_suspicious: number; vt_total: number; vt_analysis_id: string }[] | null;
+  downloads: { filename: string; url: string }[] | null;
+};
+
+type TakedownData = {
+  registrar: { registrar: string | null; abuse_email: string | null; domain: string | null };
+  hosting: { ip: string; org: string; asn: string; country: string; is_cloudflare: boolean } | null;
+  cloudflare_detected: boolean;
+  templates: { registrar: string; hosting?: string; cloudflare?: string };
 };
 
 export default function RunDetails() {
@@ -63,6 +83,11 @@ export default function RunDetails() {
   const [completeReport, setCompleteReport] = useState("");
   const [status, setStatus] = useState("loading");
   const [redirectChain, setRedirectChain] = useState<{ url: string; status: number }[]>([]);
+  const [takedown, setTakedown] = useState<TakedownData | null>(null);
+  const [takedownLoading, setTakedownLoading] = useState(false);
+  const [takedownOpen, setTakedownOpen] = useState(false);
+  const [activeTemplate, setActiveTemplate] = useState<"registrar" | "hosting" | "cloudflare">("registrar");
+  const [copied, setCopied] = useState(false);
 
   useEffect(() => {
     let isMounted = true;
@@ -164,6 +189,32 @@ export default function RunDetails() {
     }
   };
 
+  const handleTakedown = async () => {
+    if (takedown) { setTakedownOpen((o) => !o); return; }
+    setTakedownLoading(true);
+    try {
+      const res = await fetch(`${API}/api/runs/${run_id}/takedown`);
+      if (res.ok) {
+        const data = await res.json();
+        setTakedown(data);
+        setTakedownOpen(true);
+        if (data.cloudflare_detected) setActiveTemplate("cloudflare");
+        else if (data.templates?.hosting) setActiveTemplate("hosting");
+        else setActiveTemplate("registrar");
+      }
+    } catch { /* ignore */ }
+    finally { setTakedownLoading(false); }
+  };
+
+  const handleCopy = useCallback(() => {
+    if (!takedown) return;
+    const text = takedown.templates[activeTemplate] ?? "";
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  }, [takedown, activeTemplate]);
+
   if (!run) return <div className="text-dim p-8 uppercase text-xs tracking-widest">// loading run metadata...</div>;
 
   return (
@@ -192,6 +243,11 @@ export default function RunDetails() {
             {run.url && (
               <button onClick={handleRerun} className="btn-outline btn py-1 px-3 text-xs">re-run</button>
             )}
+            {status === "complete" && (
+              <button onClick={handleTakedown} className="btn-outline btn py-1 px-3 text-xs">
+                {takedownLoading ? "loading..." : takedownOpen ? "hide takedown" : "takedown"}
+              </button>
+            )}
             <button onClick={handleDelete} className="btn-outline btn py-1 px-3 text-xs !border-[var(--error)] text-[var(--error)] hover:bg-[var(--error)] hover:text-white">delete</button>
           </div>
         </div>
@@ -219,6 +275,22 @@ export default function RunDetails() {
             </div>
             {run.agent_verdict.reasoning && (
               <p className="text-[0.65rem] text-dim leading-relaxed">{run.agent_verdict.reasoning}</p>
+            )}
+            {run.agent_verdict.attack_techniques && run.agent_verdict.attack_techniques.length > 0 && (
+              <div className="flex gap-2 flex-wrap">
+                {run.agent_verdict.attack_techniques.map((t) => (
+                  <a
+                    key={t.id}
+                    href={`https://attack.mitre.org/techniques/${t.id.replace(".", "/")}/`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    title={`${t.name} (${t.source})`}
+                    className="text-[0.55rem] font-mono uppercase tracking-wider border border-[var(--border)] px-1.5 py-0.5 text-dim hover:text-[var(--purple-bright)] hover:border-[var(--purple-bright)] transition-colors"
+                  >
+                    {t.id}
+                  </a>
+                ))}
+              </div>
             )}
           </div>
         ) : run.severity ? (
@@ -254,6 +326,14 @@ export default function RunDetails() {
               <span className="text-dim">urlscan: no existing scan</span>
             )}
 
+            {run.urlhaus_hit && (
+              <span className="text-[#ff4444]">urlhaus: known malicious</span>
+            )}
+            {run.domain_age_days != null && (
+              <span className={run.domain_age_days < 30 ? "text-[#ffaa00]" : "text-dim"}>
+                domain: {run.domain_age_days}d old{run.domain_age_days < 30 ? " ⚠" : ""}
+              </span>
+            )}
             {run.campaign_id && (
               <span className="text-[var(--purple-bright)]">
                 campaign: {run.campaign_id.slice(0, 20)}
@@ -271,6 +351,70 @@ export default function RunDetails() {
         )}
       </div>
 
+      {/* takedown templates */}
+      {takedownOpen && takedown && (
+        <div className="card space-y-4">
+          <div className="flex items-center justify-between flex-wrap gap-3">
+            <h3 className="text-xs uppercase tracking-widest text-dim font-bold">takedown_templates</h3>
+            <div className="flex gap-2 flex-wrap">
+              <button
+                onClick={() => setActiveTemplate("registrar")}
+                className={`text-[0.6rem] uppercase tracking-widest border px-2 py-0.5 transition-colors ${activeTemplate === "registrar" ? "border-[var(--purple-bright)] text-[var(--purple-bright)]" : "border-[var(--border)] text-dim"}`}
+              >
+                registrar
+              </button>
+              {takedown.templates.hosting && (
+                <button
+                  onClick={() => setActiveTemplate("hosting")}
+                  className={`text-[0.6rem] uppercase tracking-widest border px-2 py-0.5 transition-colors ${activeTemplate === "hosting" ? "border-[var(--purple-bright)] text-[var(--purple-bright)]" : "border-[var(--border)] text-dim"}`}
+                >
+                  hosting
+                </button>
+              )}
+              {takedown.templates.cloudflare && (
+                <button
+                  onClick={() => setActiveTemplate("cloudflare")}
+                  className={`text-[0.6rem] uppercase tracking-widest border px-2 py-0.5 transition-colors ${activeTemplate === "cloudflare" ? "border-[var(--purple-bright)] text-[var(--purple-bright)]" : "border-[var(--border)] text-dim"}`}
+                >
+                  cloudflare
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* context row */}
+          <div className="flex gap-6 flex-wrap text-[0.6rem] uppercase tracking-widest text-dim">
+            {takedown.registrar.registrar && (
+              <span>registrar: <span className="text-[var(--fg)]">{takedown.registrar.registrar}</span></span>
+            )}
+            {takedown.registrar.abuse_email && (
+              <span>abuse contact: <span className="text-[var(--fg)]">{takedown.registrar.abuse_email}</span></span>
+            )}
+            {takedown.hosting?.org && (
+              <span>hosting: <span className="text-[var(--fg)]">{takedown.hosting.org}</span></span>
+            )}
+            {takedown.hosting?.ip && (
+              <span>server ip: <span className="text-[var(--fg)]">{takedown.hosting.ip}</span></span>
+            )}
+            {takedown.cloudflare_detected && (
+              <span className="text-[#ffaa00]">cloudflare detected</span>
+            )}
+          </div>
+
+          <div className="relative">
+            <pre className="text-[0.65rem] font-mono text-dim bg-[var(--bg)] border border-[var(--border)] p-4 whitespace-pre-wrap break-words leading-relaxed">
+              {takedown.templates[activeTemplate]}
+            </pre>
+            <button
+              onClick={handleCopy}
+              className="absolute top-2 right-2 btn-outline btn py-0.5 px-2 text-[0.6rem] uppercase tracking-widest"
+            >
+              {copied ? "copied" : "copy"}
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* redirect chain */}
       {redirectChain.length > 0 && (
         <div className="card space-y-3">
@@ -285,6 +429,73 @@ export default function RunDetails() {
                 <span className="text-[var(--purple-bright)] break-all">{hop.url}</span>
               </div>
             ))}
+          </div>
+        </div>
+      )}
+
+      {/* form submission */}
+      {run.form_submission && (
+        <div className="card space-y-3">
+          <h3 className="text-xs uppercase tracking-widest text-dim font-bold">form_interaction</h3>
+          <div className="flex flex-col gap-2 text-xs">
+            <div className="flex gap-6 flex-wrap text-[0.65rem] uppercase tracking-widest">
+              <span>action: <span className="text-[var(--purple-bright)] break-all normal-case">{run.form_submission.form_action}</span></span>
+              <span>method: <span className="text-[var(--fg)]">{run.form_submission.form_method}</span></span>
+              <span>inputs: <span className="text-[var(--fg)]">{run.form_submission.input_count}</span></span>
+            </div>
+            {run.form_submission.submission ? (
+              <div className="flex flex-col gap-1">
+                <span className="text-[0.65rem] uppercase tracking-widest text-dim">exfil endpoint</span>
+                <span className="text-[var(--error)] break-all text-[0.7rem]">{run.form_submission.submission.url}</span>
+                {run.form_submission.submission.post_data && (
+                  <span className="text-[0.6rem] text-dim font-mono break-all">{run.form_submission.submission.post_data.slice(0, 300)}</span>
+                )}
+              </div>
+            ) : (
+              <span className="text-[0.65rem] text-dim">no outbound request intercepted</span>
+            )}
+            {run.form_submission.post_submit_url && run.form_submission.post_submit_url !== run.url && (
+              <span className="text-[0.65rem] text-dim">
+                post-submit url: <span className="text-[var(--fg)] break-all">{run.form_submission.post_submit_url}</span>
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* downloaded files */}
+      {run.downloads && run.downloads.length > 0 && (
+        <div className="card space-y-3">
+          <h3 className="text-xs uppercase tracking-widest text-dim font-bold">downloaded_files</h3>
+          <div className="flex flex-col gap-2">
+            {run.downloads.map((dl, i) => {
+              const scan = run.file_scans?.find((s) => s.filename === dl.filename);
+              const malicious = scan ? scan.vt_malicious > 0 : false;
+              const vtUrl = scan?.vt_analysis_id
+                ? `https://www.virustotal.com/gui/analysis/${scan.vt_analysis_id}`
+                : null;
+              return (
+                <div key={i} className="flex items-start gap-4 text-xs flex-wrap">
+                  <span className={`font-mono shrink-0 ${malicious ? "text-[var(--error)]" : "text-[var(--fg)]"}`}>
+                    {dl.filename}
+                  </span>
+                  {scan ? (
+                    <span className={`text-[0.65rem] uppercase tracking-widest shrink-0 ${malicious ? "text-[var(--error)]" : "text-[var(--success)]"}`}>
+                      {vtUrl ? (
+                        <a href={vtUrl} target="_blank" rel="noopener noreferrer" className="hover:underline">
+                          vt: {scan.vt_malicious} malicious / {scan.vt_total} engines →
+                        </a>
+                      ) : (
+                        <>vt: {scan.vt_malicious} malicious / {scan.vt_total} engines</>
+                      )}
+                    </span>
+                  ) : (
+                    <span className="text-[0.65rem] text-dim uppercase tracking-widest">vt: not scanned</span>
+                  )}
+                  <span className="text-[0.6rem] text-dim break-all">{dl.url}</span>
+                </div>
+              );
+            })}
           </div>
         </div>
       )}

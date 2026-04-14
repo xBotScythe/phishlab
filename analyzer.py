@@ -49,6 +49,14 @@ async def run_analysis(output_dir: str) -> str:
                     session.call_tool("analyze_js_runtime", {"folder": output_dir}),
                     timeout=timeout_sec
                 )),
+                asyncio.create_task(asyncio.wait_for(
+                    session.call_tool("analyze_form_submission", {"folder": output_dir}),
+                    timeout=timeout_sec
+                )),
+                asyncio.create_task(asyncio.wait_for(
+                    session.call_tool("analyze_downloads", {"folder": output_dir}),
+                    timeout=timeout_sec
+                )),
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -60,10 +68,26 @@ async def run_analysis(output_dir: str) -> str:
 
             def _text(r): return r.content[0].text if not isinstance(r, Exception) else f"tool error: {r}"
 
-            har_data    = _text(results[0])
-            dom_data    = _text(results[1])
-            domain_data = _text(results[2])
-            js_data     = _text(results[3])
+            har_data      = _text(results[0])
+            dom_data      = _text(results[1])
+            domain_data   = _text(results[2])
+            js_data       = _text(results[3])
+            form_data     = _text(results[4])
+            download_data = _text(results[5])
+
+            form_section = ""
+            if "no form submission" not in form_data and "tool error" not in form_data:
+                form_section = f"""
+Form Submission Analysis (honeypot credentials submitted, exfil endpoint captured):
+{form_data}
+"""
+
+            download_section = ""
+            if "no downloads" not in download_data and "tool error" not in download_data:
+                download_section = f"""
+Downloaded Files (captured during detonation, scanned by VirusTotal):
+{download_data}
+"""
 
             return f"""Analyze the following phishing threat data extracted from a target URL.
 
@@ -78,6 +102,7 @@ HTML DOM Indicators of Compromise (includes Brand, Decoy Links, and Obfuscation)
 
 JavaScript Runtime Analysis (kit globals, storage, inline scripts, final URL):
 {js_data}
+{form_section}{download_section}
 
 Instructions for Formatting:
 1. DO NOT include hallucinated metadata such as "Analyst Name", "Date", or "Source". Start the report immediately.

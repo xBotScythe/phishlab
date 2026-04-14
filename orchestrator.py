@@ -79,7 +79,9 @@ class AgentOrchestrator:
     async def run_verdict(self, url: str, report: str,
                           vt_malicious: int | None = None,
                           urlscan_score: float | None = None,
-                          parent_verdict: str = "") -> dict:
+                          parent_verdict: str = "",
+                          yara_context: str = "",
+                          has_malicious_download: bool = False) -> dict:
         """full verdict pipeline: memory query -> escalation -> memory store"""
         domain = urlparse(url).netloc
 
@@ -97,12 +99,17 @@ class AgentOrchestrator:
 
         # run escalation
         try:
+            # combine memory and yara into enrichment context
+            enrichment = memory_context
+            if yara_context:
+                enrichment = f"{enrichment}\n\n{yara_context}" if enrichment else yara_context
+
             verdict = await self._call(self._escalation, "assess_threat", {
                 "report": report,
                 "url": url,
                 "vt_malicious": vt_malicious,
                 "urlscan_score": urlscan_score,
-                "memory_context": memory_context,
+                "memory_context": enrichment,
                 "parent_verdict": parent_verdict,
             })
         except Exception as e:
@@ -125,6 +132,7 @@ class AgentOrchestrator:
                 "severity": verdict.get("severity", "medium"),
                 "kit_fingerprint": verdict.get("kit_fingerprint", ""),
                 "delivery_vector": verdict.get("delivery_vector", "unknown"),
+                "has_malicious_download": has_malicious_download,
             })
         except Exception as e:
             print(f"ORCHESTRATOR: memory store failed ({e})")
@@ -144,6 +152,52 @@ class AgentOrchestrator:
         except Exception as e:
             print(f"ORCHESTRATOR: hunt decision failed ({e}), falling back to severity gate")
             return severity in ("critical", "high")
+
+    async def run_takedown(self, url: str, report: str, registrar: dict,
+                           hosting: dict, cloudflare_detected: bool,
+                           vt_malicious: int | None, vt_url: str, date_str: str) -> dict:
+        """generate abuse report emails via the hunt agent — one call per target, run concurrently"""
+        import asyncio as _asyncio
+
+        shared = {
+            "url": url,
+            "report": report,
+            "vt_malicious": vt_malicious or 0,
+            "vt_url": vt_url,
+            "date_str": date_str,
+            "hosting_org": hosting.get("org") or "",
+            "server_ip": hosting.get("ip") or "",
+        }
+
+        async def _email(target: str, recipient_name: str, abuse_email: str) -> str:
+            try:
+                result = await self._call(self._hunt, "write_takedown_email", {
+                    "target": target,
+                    "recipient_name": recipient_name,
+                    "abuse_email": abuse_email,
+                    **shared,
+                })
+                return result.get("email", "")
+            except Exception as e:
+                print(f"ORCHESTRATOR: {target} takedown failed ({e})")
+                return ""
+
+        tasks = [_email("registrar", registrar.get("registrar") or "", registrar.get("abuse_email") or "")]
+        if hosting:
+            tasks.append(_email("hosting", hosting.get("org") or "", ""))
+        if cloudflare_detected:
+            tasks.append(_email("cloudflare", "Cloudflare", "abuse@cloudflare.com"))
+
+        results = await _asyncio.gather(*tasks)
+
+        templates: dict = {"registrar": results[0]}
+        idx = 1
+        if hosting:
+            templates["hosting"] = results[idx]; idx += 1
+        if cloudflare_detected:
+            templates["cloudflare"] = results[idx]
+
+        return templates
 
     async def run_chain_filter(self, candidates: list[str], report: str, url: str) -> list[str]:
         """filter chain candidates down to urls worth detonating"""

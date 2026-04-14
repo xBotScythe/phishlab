@@ -421,5 +421,94 @@ def analyze_js_runtime(folder: str) -> str:
     return json.dumps(result, indent=2)
 
 
+@mcp.tool()
+def analyze_form_submission(folder: str) -> str:
+    """analyze form interaction results — exfil endpoint, post data, redirect behavior"""
+    if not is_safe_path(folder):
+        return "error: path outside allowed directory"
+
+    path = os.path.join(folder, "form_submission.json")
+    if not os.path.exists(path):
+        return "no form submission captured — page may not have credential forms"
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        return f"failed to read form_submission.json: {e}"
+
+    result = {
+        "form_action": data.get("form_action", ""),
+        "form_method": data.get("form_method", ""),
+        "input_count": data.get("input_count", 0),
+        "fields_filled": data.get("fields_filled", {}),
+        "post_submit_url": data.get("post_submit_url", ""),
+    }
+
+    submission = data.get("submission")
+    if submission:
+        result["exfil_endpoint"] = submission.get("url", "")
+        result["exfil_method"] = submission.get("method", "")
+        # flag if credentials were sent to a different domain
+        try:
+            action_domain = urlparse(data.get("form_action", "")).netloc
+            exfil_domain = urlparse(submission.get("url", "")).netloc
+            result["cross_domain_exfil"] = action_domain != exfil_domain and exfil_domain != ""
+        except Exception:
+            pass
+    else:
+        result["exfil_endpoint"] = "no outbound request captured"
+
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def analyze_downloads(folder: str) -> str:
+    """surface any files downloaded during detonation and their virustotal scan results"""
+    if not is_safe_path(folder):
+        return "error: path outside allowed directory"
+
+    downloads_path = os.path.join(folder, "downloads.json")
+    scans_path = os.path.join(folder, "file_scan_results.json")
+
+    if not os.path.exists(downloads_path):
+        return "no downloads captured during detonation"
+
+    try:
+        with open(downloads_path) as f:
+            downloads = json.load(f)
+    except Exception as e:
+        return f"failed to read downloads.json: {e}"
+
+    scans: dict[str, dict] = {}
+    if os.path.exists(scans_path):
+        try:
+            with open(scans_path) as f:
+                for entry in json.load(f):
+                    scans[entry.get("filename", "")] = entry
+        except Exception:
+            pass
+
+    result = []
+    for dl in downloads:
+        filename = dl.get("filename", "unknown")
+        entry: dict = {
+            "filename": filename,
+            "source_url": dl.get("url", ""),
+        }
+        scan = scans.get(filename)
+        if scan:
+            total = scan["malicious"] + scan["suspicious"] + scan["harmless"] + scan["undetected"]
+            entry["vt_malicious"] = scan["malicious"]
+            entry["vt_suspicious"] = scan["suspicious"]
+            entry["vt_total"] = total
+            entry["vt_analysis_id"] = scan.get("analysis_id", "")
+        else:
+            entry["vt_result"] = "not scanned (no VT API key or scan pending)"
+        result.append(entry)
+
+    return json.dumps(result, indent=2)
+
+
 if __name__ == "__main__":
     mcp.run()

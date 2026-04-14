@@ -1,7 +1,9 @@
 import json
 import os
+import random
+import string
 import sys
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse, urlencode
 
 from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
@@ -54,8 +56,7 @@ def detonate(target_url, output_dir="/cage_drop"):
         ).apply_stealth_sync(page)
 
         try:
-            page.goto(target_url, timeout=30000, wait_until="domcontentloaded")
-            page.wait_for_timeout(3000)
+            page.goto(target_url, timeout=30000, wait_until="load")
 
             # cf phishing interstitial bypass
             try:
@@ -75,7 +76,6 @@ def detonate(target_url, output_dir="/cage_drop"):
                         break
 
                 if not clicked:
-                    # js fallback — works even if selector matching fails
                     clicked = page.evaluate("""() => {
                         const links = Array.from(document.querySelectorAll('a'));
                         const target = links.find(a => a.textContent.includes('Ignore'));
@@ -86,16 +86,26 @@ def detonate(target_url, output_dir="/cage_drop"):
                         print("cloudflare interstitial bypassed via js")
 
                 if clicked:
-                    page.wait_for_timeout(5000)
+                    page.wait_for_load_state("load", timeout=10000)
             except Exception:
                 pass
 
-            # wait for network to settle (turnstile, js redirects, lazy loaders)
-            # falls back to 12s hard wait if networkidle never fires
-            try:
-                page.wait_for_load_state("networkidle", timeout=12000)
-            except Exception:
-                page.wait_for_timeout(12000)
+            # wait for redirects to settle
+            _prev_url = page.url
+            for _ in range(6):
+                try:
+                    page.wait_for_load_state("networkidle", timeout=4000)
+                    break
+                except Exception:
+                    pass
+                _current_url = page.url
+                if _current_url != _prev_url:
+                    print(f"redirect detected: {_current_url}")
+                    _prev_url = _current_url
+                else:
+                    break
+
+            print(f"final url: {page.url}")
 
             # capture full page screenshot
             page.screenshot(path=f"{output_dir}/screenshot.png", full_page=True)
@@ -107,7 +117,6 @@ def detonate(target_url, output_dir="/cage_drop"):
                 f.write(html_content)
             print("html saved")
             
-            # js injection — dom iocs
             print("extracting DOM structures via JS injection...")
             js_iocs = page.evaluate("""() => {
                 return {
@@ -124,15 +133,12 @@ def detonate(target_url, output_dir="/cage_drop"):
                 json.dump(js_iocs, f, indent=2)
             print("DOM iocs extracted")
 
-            # js runtime analysis — captures things static html can't see
             print("running js runtime analysis...")
             js_runtime = page.evaluate("""() => {
-                // kit signatures: globals that phishing kits commonly set
                 const kitGlobals = Object.keys(window)
                     .filter(k => k.startsWith('__') || k.startsWith('_gt') || k.startsWith('_ph'))
                     .slice(0, 30);
 
-                // localStorage (truncate values)
                 const ls = {};
                 try {
                     for (let i = 0; i < window.localStorage.length; i++) {
@@ -141,7 +147,6 @@ def detonate(target_url, output_dir="/cage_drop"):
                     }
                 } catch(e) {}
 
-                // sessionStorage
                 const ss = {};
                 try {
                     for (let i = 0; i < window.sessionStorage.length; i++) {
@@ -150,7 +155,6 @@ def detonate(target_url, output_dir="/cage_drop"):
                     }
                 } catch(e) {}
 
-                // inline script content (obfuscated kits often live here)
                 const inlineScripts = Array.from(document.scripts)
                     .filter(s => !s.src && s.textContent.length > 50)
                     .map(s => s.textContent.slice(0, 500))
@@ -170,6 +174,137 @@ def detonate(target_url, output_dir="/cage_drop"):
             with open(f"{output_dir}/js_runtime.json", "w", encoding="utf-8") as f:
                 json.dump(js_runtime, f, indent=2)
             print("JS runtime analysis complete")
+
+            # download capture
+            downloads_dir = os.path.join(output_dir, "downloads")
+            captured_downloads = []
+
+            def _on_download(download):
+                try:
+                    os.makedirs(downloads_dir, exist_ok=True)
+                    dest = os.path.join(downloads_dir, download.suggested_filename or "file")
+                    download.save_as(dest)
+                    captured_downloads.append({
+                        "filename": download.suggested_filename,
+                        "url": download.url,
+                        "path": dest,
+                    })
+                    print(f"DOWNLOAD: captured {download.suggested_filename} from {download.url}")
+                except Exception as e:
+                    print(f"DOWNLOAD: save failed ({e})")
+
+            page.on("download", _on_download)
+            page.wait_for_timeout(2000)
+            page.remove_listener("download", _on_download)
+
+            if captured_downloads:
+                with open(f"{output_dir}/downloads.json", "w", encoding="utf-8") as f:
+                    json.dump(captured_downloads, f, indent=2)
+
+            # form interaction
+            try:
+                rand_user = ''.join(random.choices(string.ascii_lowercase, k=8))
+                rand_domain = ''.join(random.choices(string.ascii_lowercase, k=6))
+                honeypot_email = f"{rand_user}@{rand_domain}.com"
+                honeypot_pass = ''.join(random.choices(string.ascii_letters + string.digits + "!@#$", k=14))
+
+                form_result = page.evaluate("""([honeypotEmail, honeypotPass]) => {
+                    const forms = Array.from(document.forms);
+                    const candidates = forms.filter(f => {
+                        const inputs = Array.from(f.querySelectorAll('input'));
+                        return inputs.some(i => i.type === 'password');
+                    });
+
+                    if (candidates.length === 0) return null;
+
+                    const form = candidates[0];
+                    const inputs = Array.from(form.querySelectorAll('input'));
+                    const filled = {};
+
+                    for (const input of inputs) {
+                        if (input.type === 'hidden' || input.type === 'submit' || input.type === 'button') continue;
+                        if (input.type === 'email' || input.name.match(/email|user|login|account/i) || input.type === 'text') {
+                            input.value = honeypotEmail;
+                            input.dispatchEvent(new Event('input', { bubbles: true }));
+                            input.dispatchEvent(new Event('change', { bubbles: true }));
+                            filled[input.name || input.type] = honeypotEmail;
+                        } else if (input.type === 'password') {
+                            input.value = honeypotPass;
+                            input.dispatchEvent(new Event('input', { bubbles: true }));
+                            input.dispatchEvent(new Event('change', { bubbles: true }));
+                            filled[input.name || 'password'] = '***';
+                        }
+                    }
+
+                    return {
+                        action: form.action || window.location.href,
+                        method: (form.method || 'GET').toUpperCase(),
+                        fields_filled: filled,
+                        input_count: inputs.filter(i => i.type !== 'hidden').length,
+                    };
+                }""", [honeypot_email, honeypot_pass])
+
+                if form_result:
+                    print(f"FORM: found credential form, action={form_result['action']} method={form_result['method']}")
+
+                    submission_capture = {"request": None}
+                    form_action = form_result["action"]
+
+                    def capture_request(request):
+                        # ignore static assets — only care about the form submission itself
+                        if request.resource_type not in ("document", "xhr", "fetch"):
+                            return
+                        if submission_capture["request"] is not None:
+                            return
+                        submission_capture["request"] = {
+                            "url": request.url,
+                            "method": request.method,
+                            "post_data": request.post_data[:2000] if request.post_data else None,
+                        }
+
+                    page.on("request", capture_request)
+
+                    try:
+                        if form_result["method"] == "GET":
+                            # GET forms encode credentials into the URL — navigate and capture
+                            params = {k: (honeypot_pass if v == "***" else v) for k, v in form_result["fields_filled"].items()}
+                            qs = urlencode(params)
+                            parsed = urlparse(form_action)
+                            existing_qs = parsed.query
+                            submit_url = urlunparse(parsed._replace(query=(existing_qs + "&" + qs) if existing_qs else qs))
+                            page.goto(submit_url, wait_until="load", timeout=8000)
+                            # synthesize the submission record from what we built
+                            if not submission_capture["request"]:
+                                submission_capture["request"] = {
+                                    "url": submit_url,
+                                    "method": "GET",
+                                    "post_data": None,
+                                }
+                        else:
+                            page.evaluate("document.forms[0].requestSubmit ? document.forms[0].requestSubmit() : document.forms[0].submit()")
+                            try:
+                                page.wait_for_load_state("networkidle", timeout=5000)
+                            except Exception:
+                                page.wait_for_timeout(2000)
+                    except Exception:
+                        pass
+
+                    page.remove_listener("request", capture_request)
+
+                    form_data = {
+                        "form_action": form_action,
+                        "form_method": form_result["method"],
+                        "fields_filled": form_result["fields_filled"],
+                        "input_count": form_result["input_count"],
+                        "submission": submission_capture["request"],
+                        "post_submit_url": page.url,
+                    }
+
+                    with open(f"{output_dir}/form_submission.json", "w", encoding="utf-8") as f:
+                        json.dump(form_data, f, indent=2)
+                    print(f"FORM: submission -> {submission_capture['request']['url'] if submission_capture['request'] else 'no request captured'}")
+            except Exception as e:
+                print(f"FORM: interaction failed ({e})")
 
         except Exception as e:
             print(f"error: {str(e)}")
