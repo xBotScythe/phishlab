@@ -38,3 +38,5 @@ coverage/
 *.sqlite3
 *.db
 .docker_build_hash
+agent_memory.json
+.frontend_build_hash

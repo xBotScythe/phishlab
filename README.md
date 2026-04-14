@@ -8,16 +8,18 @@ local threat detonation and AI analysis environment. isolates suspicious URLs in
 URL submitted
     |
     v
-[Docker Container] -- playwright captures screenshot, HAR, DOM, JS runtime
+[Docker Container] -- playwright captures screenshot, HAR, DOM, JS runtime, form interaction
     |
     v
-[MCP Extraction Server] -- HAR, DOM IoCs, WHOIS/SSL, IP geo, brand similarity, JS runtime
+[MCP Extraction Server] -- HAR, DOM IoCs, WHOIS/SSL, IP geo, brand similarity, JS runtime, form exfil
+    |
+    +--[YARA Scanner]-----------> deterministic kit detection against phishing rulesets
     |
     v
 [Threat Intel] -- VirusTotal + URLScan enrichment (optional)
     |
     v
-[Local LLM] -- vision-capable model analyzes screenshot + structured data
+[Local LLM] -- vision-capable model analyzes screenshot + structured data + YARA hits
     |
     v
 [Orchestrator] -- MCP client connecting to all agent servers
@@ -26,6 +28,8 @@ URL submitted
     |
     +--[MCP: Escalation Server]--> structured verdict (severity, delivery vector, kit fingerprint,
     |                               user interaction, reasoning) via schema-enforced LLM output
+    |
+    +--[ATT&CK Mapping]---------> verdict + YARA + form exfil -> MITRE technique IDs
     |
     +--[MCP: Hunt Server]--------> chain hunt decision + candidate filtering
     |
@@ -103,6 +107,39 @@ the verdict includes:
 for chain children, the parent's verdict is passed as context so the LLM understands where in the attack chain this URL sits.
 
 severity badges appear in the run list, run detail page, and diff comparisons. chain hunting is skipped entirely for `low` and `benign` runs.
+
+### YARA kit detection
+detonation artifacts (HTML, JS runtime, IoC data) are scanned against phishing-specific YARA rules before the LLM even runs. rules cover:
+- **credential harvesting** — forms with password fields, email hash extraction from URL params
+- **brand impersonation** — Office 365, Google, Adobe, banking portal signatures
+- **exfiltration patterns** — Telegram bot exfil, Discord webhook exfil, PHP mailer handlers
+- **kit signatures** — EvilProxy, 16shop, Storm-1575/DadSec, Greatness PaaS
+- **obfuscation** — base64 decoded at runtime, eval/unescape chains
+- **evasion** — bot cloaking via user-agent/referrer checks
+
+YARA matches are deterministic — they anchor the LLM's verdict with concrete evidence rather than relying solely on inference. results feed into both the report prompt and the escalation server.
+
+custom rules can be added to `yara_rules/` — any `.yar` file in that directory is compiled at startup.
+
+### form interaction
+after capturing the screenshot and DOM (preserving original state), the container attempts to interact with credential forms:
+1. finds forms with password inputs
+2. fills with honeypot data (`test@phishlab.local` / `PhishLab2024!`)
+3. submits the form and intercepts the outbound request
+4. captures the exfil endpoint URL, HTTP method, and POST data
+
+the exfil endpoint is the most actionable artifact for takedowns — it reveals where stolen credentials are actually sent (often a Telegram bot, Discord webhook, or PHP handler on a different domain). the endpoint is included in IoC exports and displayed in the run detail.
+
+form interaction is best-effort: it works on standard `<form>` submissions (covering most phishing kits). JS-only fetch/XHR submissions without a `<form>` element are already captured in the HAR.
+
+### MITRE ATT&CK mapping
+each verdict is automatically mapped to ATT&CK technique IDs based on:
+- **delivery vector** → initial access techniques (T1566.002 for email links, T1660 for SMS, etc.)
+- **user interaction** → execution/collection techniques (T1056.002 for credential capture, T1204.002 for file downloads)
+- **YARA matches** → category-specific techniques (T1027 for obfuscation, T1036.005 for brand masquerading)
+- **form exfil** → exfiltration techniques (T1041 for C2, T1567.002 for web service exfil)
+
+technique IDs are clickable links to the MITRE ATT&CK knowledge base in the run detail page. they're also embedded as `attack-pattern` objects with relationships in the STIX 2.1 export, making it directly ingestible by threat intelligence platforms.
 
 ### cross-sample memory
 the memory server maintains a persistent store of all verdict observations. when a new URL is analyzed, the orchestrator queries memory for:
@@ -237,8 +274,10 @@ phishlab/
 ├── agent_hunt_server.py        # mcp server: chain hunt decisions + candidate filtering
 ├── agent_memory_server.py      # mcp server: cross-sample memory with auto-compaction
 ├── schemas.py                  # shared pydantic models for all agent communication
+├── yara_scanner.py             # YARA rule scanning against detonation artifacts
+├── attack_mapping.py           # MITRE ATT&CK technique mapping from verdicts + YARA + form data
 ├── analyzer.py                 # mcp client, builds prompt from extracted data
-├── mcp_server.py               # mcp tools: HAR, DOM, WHOIS/SSL, IP geo, JS runtime, brand similarity
+├── mcp_server.py               # mcp tools: HAR, DOM, WHOIS/SSL, IP geo, JS runtime, brand similarity, form submission
 ├── detonation.py               # shared docker container runner
 ├── detonate_url.py             # runs inside the container (playwright + stealth)
 ├── threat_intel.py             # virustotal + urlscan enrichment
@@ -252,6 +291,7 @@ phishlab/
 ├── Dockerfile                  # detonation container image
 ├── docker-compose.yml          # postgres database
 ├── agent_memory.json           # persistent verdict memory (managed by memory server)
+├── yara_rules/                 # phishing kit YARA rulesets (add custom .yar files here)
 ├── frontend/                   # next.js dashboard
 │   ├── app/                    # pages (dashboard, detonate, run detail, diff, campaigns, analytics, history)
 │   ├── components/             # shared ui (RunsList, FeedControl, StatusBadge, HealthIndicator)

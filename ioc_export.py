@@ -68,12 +68,33 @@ def _extract_from_report(report: str) -> list[dict]:
     return iocs
 
 
+def _extract_from_form(folder: str) -> list[dict]:
+    """extract exfil endpoint from form submission capture"""
+    iocs = []
+    path = os.path.join(folder, "form_submission.json")
+    if not os.path.exists(path):
+        return iocs
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        submission = data.get("submission")
+        if submission and submission.get("url"):
+            iocs.append({"type": "url", "value": submission["url"], "context": "exfil_endpoint"})
+        action = data.get("form_action", "")
+        if action and action.startswith("http"):
+            iocs.append({"type": "url", "value": action, "context": "form_action"})
+    except Exception:
+        pass
+    return iocs
+
+
 def collect_iocs(folder: str, target_url: str, report: str) -> list[dict]:
     """gather unique iocs from all available sources"""
     iocs = []
     if target_url:
         iocs.append({"type": "url", "value": target_url})
     iocs += _extract_from_har(folder)
+    iocs += _extract_from_form(folder)
     iocs += _extract_from_report(report)
 
     # dedupe by (type, value)

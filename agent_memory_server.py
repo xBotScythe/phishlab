@@ -116,6 +116,11 @@ def query_memory(domain: str, kit_fingerprint: str = "") -> MemoryQueryResult:
             if shared:
                 pattern_note = f"domain '{shared[0][0]}' analyzed {shared[0][1]} times"
 
+    drop_count = sum(1 for e in top if e.get("has_malicious_download"))
+    if drop_count:
+        drop_note = f"malicious file drops seen in {drop_count} prior sample(s) from this domain/kit"
+        pattern_note = f"{pattern_note}; {drop_note}" if pattern_note else drop_note
+
     return MemoryQueryResult(
         entries=[MemoryEntry(**{k: e.get(k, "") for k in MemoryEntry.model_fields}) for e in top],
         pattern_note=pattern_note,
@@ -129,6 +134,7 @@ def store_memory(
     severity: str,
     kit_fingerprint: str,
     delivery_vector: str,
+    has_malicious_download: bool = False,
 ) -> str:
     """store a verdict observation for future cross-sample correlation"""
     entries = _load()
@@ -139,6 +145,7 @@ def store_memory(
         "severity": severity,
         "kit_fingerprint": kit_fingerprint,
         "delivery_vector": delivery_vector,
+        "has_malicious_download": has_malicious_download,
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     })
 

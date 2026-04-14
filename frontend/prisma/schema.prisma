@@ -33,6 +33,8 @@ model AnalysisRun {
   severity       String?
   threatSummary  String?
   agentVerdict   String?  @db.Text
+  urlhausHit     Boolean?
+  domainAgeDays  Int?
 }
 
 model FeedStatus {
@@ -40,4 +42,14 @@ model FeedStatus {
   active    Boolean  @default(false)
   lastRun   DateTime?
   batchSize Int      @default(5)
+}
+
+model Watchlist {
+  id            String    @id @default(uuid())
+  url           String    @unique
+  intervalHours Int       @default(24)
+  lastRun       DateTime?
+  createdAt     DateTime  @default(now())
+  active        Boolean   @default(true)
+  label         String?
 }

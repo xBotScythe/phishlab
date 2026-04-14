@@ -29,8 +29,13 @@ class MemoryEntry(BaseModel):
     kit_fingerprint: str
     delivery_vector: str
     timestamp: str
+    has_malicious_download: bool = False
 
 
 class MemoryQueryResult(BaseModel):
     entries: list[MemoryEntry]
     pattern_note: str
+
+
+class TakedownEmail(BaseModel):
+    email: str

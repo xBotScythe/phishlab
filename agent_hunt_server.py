@@ -3,7 +3,7 @@ import os
 import ollama
 from mcp.server.fastmcp import FastMCP
 
-from schemas import ChainFilter, HuntDecision
+from schemas import ChainFilter, HuntDecision, TakedownEmail
 
 mcp = FastMCP("phishlab_hunt")
 
@@ -100,6 +100,60 @@ skip: CDNs, analytics, social media, fonts, legitimate services, same-origin sta
     except Exception as e:
         print(f"CHAIN FILTER: failed ({e}), approving all candidates")
         return ChainFilter(approve=candidates, skip=[], reason=f"llm failed, passing all through")
+
+
+@mcp.tool()
+def write_takedown_email(
+    target: str,
+    url: str,
+    report: str,
+    recipient_name: str,
+    abuse_email: str,
+    hosting_org: str,
+    server_ip: str,
+    vt_malicious: int,
+    vt_url: str,
+    date_str: str,
+) -> TakedownEmail:
+    """write a single abuse report email. target is one of: registrar, hosting, cloudflare"""
+
+    target_context = {
+        "registrar": f"You are writing to the domain registrar ({recipient_name}, {abuse_email}) asking them to suspend the domain.",
+        "hosting": f"You are writing to the hosting provider ({hosting_org}, server IP {server_ip}) asking them to take the content offline.",
+        "cloudflare": "You are writing to Cloudflare (abuse@cloudflare.com) asking them to terminate services for this domain.",
+    }.get(target, f"You are writing to {recipient_name} asking them to take action.")
+
+    prompt = f"""Write a short abuse report email to get a phishing site taken down.
+
+{target_context}
+
+Phishing URL: {url}
+Date: {date_str}
+VirusTotal ({vt_malicious} engines flagged): {vt_url}
+
+Analysis report excerpt:
+{report[:2500]}
+
+Rules:
+- Two short paragraphs max.
+- Don't explain what phishing is. They know.
+- State facts, name the brand being impersonated, ask for action.
+- Include the VirusTotal link so they can verify independently.
+- Include To: and Subject: lines at the top.
+- Be direct and human, not corporate."""
+
+    try:
+        response = ollama.chat(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            keep_alive="10m",
+        )
+        email_text = response.message.content.strip()
+        print(f"TAKEDOWN: wrote {target} email for {url}")
+        return TakedownEmail(email=email_text)
+    except Exception as e:
+        print(f"TAKEDOWN: {target} email failed ({e})")
+        return TakedownEmail(email="")
 
 
 if __name__ == "__main__":

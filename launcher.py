@@ -8,8 +8,25 @@ import threading
 import hashlib
 from pathlib import Path
 
-API_PORT = 8000
-FRONTEND_PORT = 3000
+def _load_env_ports():
+    """read .env for port overrides before dotenv is available"""
+    env_file = Path(__file__).parent / ".env"
+    ports = {}
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("API_PORT="):
+                ports["api"] = line.split("=", 1)[1].strip().strip('"')
+            elif line.startswith("FRONTEND_PORT="):
+                ports["frontend"] = line.split("=", 1)[1].strip().strip('"')
+    return ports
+
+_ports = _load_env_ports()
+API_PORT = int(os.environ.get("API_PORT", _ports.get("api", 8000)))
+FRONTEND_PORT = int(os.environ.get("FRONTEND_PORT", _ports.get("frontend", 3000)))
+# expose to child processes (uvicorn reads API_PORT via args; next start reads PORT)
+os.environ.setdefault("API_PORT", str(API_PORT))
+os.environ["PORT"] = str(FRONTEND_PORT)
 BASE_DIR = Path(__file__).parent.absolute()
 FRONTEND_DIR = BASE_DIR / "frontend"
 VENV_DIR = BASE_DIR / "venv"

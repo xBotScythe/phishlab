@@ -159,7 +159,16 @@ export default function RunsList({ limit }: { limit?: number }) {
             return (
               <div key={group.url} className="flex flex-col gap-0.5">
                 <Link href={href} className="flex-1 min-w-0">
-                  <div className="card px-4 py-3 flex items-center justify-between hover:bg-[var(--bg-raised)] transition-colors overflow-hidden">
+                  <div className="card px-4 py-3 flex items-center gap-4 hover:bg-[var(--bg-raised)] transition-colors overflow-hidden">
+                    {latest.has_screenshot && (
+                      <img
+                        src={`${API}/api/runs/${latest.id}/screenshot`}
+                        alt=""
+                        loading="lazy"
+                        className="w-16 h-12 object-cover object-top shrink-0 border border-[var(--border)] opacity-80"
+                        onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                      />
+                    )}
                     <div className="min-w-0 flex-1">
                       <p className="text-xs font-bold text-[var(--purple-bright)] truncate tracking-tight">
                         {group.url}
@@ -168,7 +177,7 @@ export default function RunsList({ limit }: { limit?: number }) {
                         {latest.created_at ? new Date(latest.created_at).toLocaleString() : `ID: ${latest.id}`}
                       </p>
                     </div>
-                    <div className="flex items-center gap-3 ml-4">
+                    <div className="flex items-center gap-3 ml-auto shrink-0">
                       {group.runs.length > 1 && (
                         <span className="text-[0.6rem] uppercase tracking-widest text-dim border border-[var(--border)] px-1.5 py-0.5">
                           {group.runs.length}x
